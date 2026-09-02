@@ -46,9 +46,11 @@ Result:
 BlindBadge usage:
   blind_badge_app help
   blind_badge_app status
-  blind_badge_app obstacle <distance_cm> <front|left|right>
-  blind_badge_app step_down <front|left|right>
-  blind_badge_app emergency
+  blind_badge_app obstacle <distance_cm> <front|left|right> [--ai|--agent]
+  blind_badge_app step_down <front|left|right> [--ai|--agent]
+  blind_badge_app emergency [--ai|--agent]
+  --ai: call ai_agent LLM router directly and print ai_response
+  --agent: send ai_prompt to running ai_agent and wait for ai_response
 ```
 
 Status: pass, no crash.
@@ -290,4 +292,142 @@ Conclusion:
 
 ```text
 The current install_skill command cannot load a local stdin Skill. BlindBadge Skill demo should install from an HTTPS raw URL after the repository is pushed, or copy the Skill file into /data/agent/skills/ through another supported transport such as adb push.
+```
+
+## BlindBadge Direct AI Loop Test
+
+Test time: 2026-09-02 21:04 CST
+
+Test goal:
+
+```text
+blind_badge_app event -> ai_prompt -> ai_agent llm_router/llm_proxy -> MiMo response
+```
+
+Build result:
+
+```text
+./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap --cmake -j2
+build completed successfully
+```
+
+Runtime MiMo configuration:
+
+```bash
+ai_agent
+router_set mimo <MIMO_TOKEN_PLAN_KEY>
+router_status
+quit
+```
+
+Observed router state:
+
+```text
+backend_count: 1
+host: token-plan-cn.xiaomimimo.com
+model: mimo-v2.5
+status: ok
+```
+
+Command:
+
+```bash
+blind_badge_app obstacle 80 front --ai
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 80
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_status: calling ai_agent llm router...
+[BlindBadge] ai_response: 前方八十厘米处有障碍，请小心慢行。
+```
+
+Command:
+
+```bash
+blind_badge_app step_down front --ai
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: step_down
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方可能有下行台阶，请停一下，用手杖或脚尖确认。
+[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_status: calling ai_agent llm router...
+[BlindBadge] ai_response: 前方可能有台阶，请注意脚下安全。
+```
+
+Command:
+
+```bash
+blind_badge_app emergency --ai
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: emergency
+[BlindBadge] suggestion: 已触发求助。建议发送：我需要帮助，请联系我或前往我的当前位置。
+[BlindBadge] ai_prompt: 你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。只输出一句简短求助信息，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_status: calling ai_agent llm router...
+[BlindBadge] ai_response: 紧急求助！请立即联系我。
+```
+
+Command:
+
+```bash
+blind_badge_app status --ai
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: status
+[BlindBadge] status: running
+[BlindBadge] mode: qemu_event_simulation
+[BlindBadge] features: obstacle, step_down, emergency
+[BlindBadge] suggestion: 系统正在运行，可继续模拟障碍、台阶或求助事件。
+[BlindBadge] ai_prompt: 你是盲人辅助胸牌。设备状态正常，请生成一句简短的系统就绪提示。
+[BlindBadge] ai_status: calling ai_agent llm router...
+[BlindBadge] ai_response: 系统已就绪，可以使用。
+```
+
+Regression check:
+
+```bash
+blind_badge_app obstacle 40 left
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 40
+[BlindBadge] direction: left
+[BlindBadge] suggestion: 左侧40厘米有障碍，请立即停下确认。
+[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到左侧40厘米有障碍，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+```
+
+Conclusion:
+
+```text
+The first in-app AI loop is validated through the existing ai_agent llm_router and llm_proxy code. The baseline event simulator still works without --ai.
+```
+
+## BlindBadge Message Bus Prototype Note
+
+`blind_badge_app --agent` registers an outbound tap on channel `blind_badge`, pushes the event prompt to `message_bus_push_inbound()`, and waits for an outbound response. This compiles and links, but it was not accepted as the primary QEMU demo path yet because starting `ai_agent` also starts its own `vela>` CLI thread, which occupies serial input and prevents running `blind_badge_app` from NSH at the same time in this headless console workflow.
+
+Current demo path:
+
+```text
+Use --ai for the verified QEMU AI loop.
+Keep --agent as the next integration target after adding a non-interactive ai_agent service start mode or a supported app-to-agent request API.
 ```
