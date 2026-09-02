@@ -10,6 +10,7 @@
 
   <project path="contest2026_024_BPshenjingwangluoyongdongji" name="contest2026_024_BPshenjingwangluoyongdongji">
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_024_hello_app"/>
+    <linkfile src="app/blind_badge_app" dest="packages/demos/contest2026_024_blind_badge_app"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_024_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_024_board"/>
   </project>

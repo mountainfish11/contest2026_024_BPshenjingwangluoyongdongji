@@ -1,14 +1,14 @@
 ############################################################################
-# Contest 2026 team 024 hello app - Makefile
+# Contest 2026 team 024 blind badge app - Makefile
 ############################################################################
 
 include $(APPDIR)/Make.defs
 
-PROGNAME  = hello_app
+PROGNAME  = blind_badge_app
 PRIORITY  = SCHED_PRIORITY_DEFAULT
-STACKSIZE = 2048
-MODULE    = $(CONFIG_LVX_USE_DEMO_CONTEST2026_024_HELLO_APP)
+STACKSIZE = 16384
+MODULE    = $(CONFIG_LVX_USE_DEMO_CONTEST2026_024_BLIND_BADGE_APP)
 
-MAINSRC = hello_app_main.c
+MAINSRC = blind_badge_app_main.c
 
 include $(APPDIR)/Application.mk

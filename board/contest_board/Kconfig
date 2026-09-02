@@ -1,11 +1,11 @@
 #
-# Contest 2026 team 000 board placeholder
+# Contest 2026 team 024 board placeholder
 #
 
-if ARCH_BOARD_CONTEST2026_000_BOARD
+if ARCH_BOARD_CONTEST2026_024_BOARD
 
-config ARCH_BOARD_CONTEST2026_000_BOARD_TAG
+config ARCH_BOARD_CONTEST2026_024_BOARD_TAG
 	string "Board tag"
-	default "contest2026_000_board"
+	default "contest2026_024_board"
 
 endif
