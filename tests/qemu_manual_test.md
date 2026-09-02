@@ -265,3 +265,29 @@ Conclusion:
 ```text
 The first AI loop is complete. BlindBadge can generate an ai_prompt, and the prompt can be manually sent to ai_agent ask. MiMo returns a short safety reminder through the configured router backend.
 ```
+
+## Skill Install Limitation Test
+
+Test goal:
+
+```text
+Verify whether ai_agent can install a local Skill through stdin.
+```
+
+Command:
+
+```bash
+install_skill blind-badge -
+```
+
+Observed result:
+
+```text
+Only HTTPS URLs are allowed
+```
+
+Conclusion:
+
+```text
+The current install_skill command cannot load a local stdin Skill. BlindBadge Skill demo should install from an HTTPS raw URL after the repository is pushed, or copy the Skill file into /data/agent/skills/ through another supported transport such as adb push.
+```
