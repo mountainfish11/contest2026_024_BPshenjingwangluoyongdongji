@@ -2,6 +2,8 @@
 
 BlindBadge is an AI hardware prototype for blind and low-vision users. It simulates a wearable safety badge that detects nearby hazards, generates a local safety suggestion, and can call MiMo through openvela `ai_agent` to produce one short voice-friendly reminder.
 
+The first hardware target is ESP32-S3-EYE. BlindBadge is positioned as a safety-reminder prototype, not a mature blind navigation device or a replacement for a cane, guide dog, or professional assistive equipment.
+
 ## Track
 
 AI hardware product innovation.
@@ -174,6 +176,7 @@ Fixed acceptance and submission docs:
 docs/acceptance_checklist.md
 docs/technical_architecture.md
 docs/demo_script_3min.md
+docs/hardware_plan_esp32_s3_eye.md
 docs/clean_reproduction_check.md
 docs/final_submission_materials.md
 ```

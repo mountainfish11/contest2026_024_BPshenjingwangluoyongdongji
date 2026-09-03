@@ -40,7 +40,11 @@ Use this page as the submission index for BlindBadge.
 
    User scenario and product MVP.
 
-9. `protocol/blind_badge_protocol.md`
+9. `docs/hardware_plan_esp32_s3_eye.md`
+
+   ESP32-S3-EYE hardware positioning, board resource mapping, safety boundary, and staged hardware plan.
+
+10. `protocol/blind_badge_protocol.md`
 
    Event protocol direction for later sensor integration.
 
@@ -64,6 +68,7 @@ blind_badge_app demo --ai
 ## What Judges Should See
 
 - A clear assistive hardware scenario for blind and low-vision users.
+- A clear safety boundary: this is a safety-reminder prototype, not a mature blind navigation replacement.
 - A custom `ai_agent` Skill that is actually installed into the runtime loader path.
 - Safety reminders constrained to one short Chinese sentence.
 - Local deterministic fallback when MiMo is unavailable.
@@ -110,3 +115,5 @@ Then connect actions:
 - `action.voice` -> TTS playback;
 - `action.vibration` -> vibration motor;
 - `action.emergency_send` -> phone companion, SMS, Feishu, or MQTT gateway.
+
+ESP32-S3-EYE v1 should prioritize button-triggered emergency, camera/preset obstacle events, LCD/serial debug output, Wi-Fi MiMo access, and an external vibration motor or buzzer.

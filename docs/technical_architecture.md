@@ -136,9 +136,20 @@ This means the prototype can demonstrate AI value while still behaving like an a
 
 The current CLI simulator can be replaced incrementally:
 
-- sensor driver reads distance or camera obstacle events;
+- ESP32-S3-EYE button, camera, accelerometer, or serial preset creates an input event;
 - sensor adapter creates `struct blind_badge_event`;
 - existing policy, AI, fallback, and action modules stay unchanged;
 - `action.voice` maps to TTS playback;
-- `action.vibration` maps to a vibration motor driver;
+- `action.vibration` maps to an external vibration motor or buzzer;
 - `action.emergency_send` maps to SMS, Feishu, MQTT, or phone companion integration.
+
+The first hardware target is ESP32-S3-EYE. Its board resources should be used conservatively:
+
+- OV2640 camera: scene input or image capture, not claimed as reliable centimeter-level ranging;
+- function button: first real `emergency` trigger;
+- QMA7981 accelerometer: posture or strong-motion signal;
+- LCD and serial logs: developer/judge output;
+- Wi-Fi: MiMo and `ai_agent` network path;
+- external vibration motor or buzzer: minimum real user-facing alert.
+
+See `docs/hardware_plan_esp32_s3_eye.md` for hardware boundaries and staged delivery.
