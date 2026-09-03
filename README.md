@@ -168,6 +168,16 @@ See `docs/blind_badge_skill.md` for install and verification notes.
 
 ## Verification
 
+Fixed acceptance and submission docs:
+
+```text
+docs/acceptance_checklist.md
+docs/technical_architecture.md
+docs/demo_script_3min.md
+docs/clean_reproduction_check.md
+docs/final_submission_materials.md
+```
+
 Manual verification is recorded in:
 
 ```text
