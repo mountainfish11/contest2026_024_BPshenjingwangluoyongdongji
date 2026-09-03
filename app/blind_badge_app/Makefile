@@ -13,6 +13,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/packages/ai_agent/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/packages/ai_agent/src
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/cjson/cJSON
 
+CSRCS = blind_badge_action.c blind_badge_ai.c blind_badge_event.c blind_badge_policy.c blind_badge_skill.c
 MAINSRC = blind_badge_app_main.c
 
 include $(APPDIR)/Application.mk

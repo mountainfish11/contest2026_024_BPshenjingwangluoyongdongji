@@ -292,7 +292,7 @@ Only HTTPS URLs are allowed
 Conclusion:
 
 ```text
-The current install_skill command cannot load a local stdin Skill. BlindBadge Skill demo should install from an HTTPS raw URL after the repository is pushed, or copy the Skill file into /data/agent/skills/ through another supported transport such as adb push.
+The ai_agent built-in install_skill command cannot load a local stdin Skill. This limitation is now avoided by the project-specific blind_badge_app install_skill command, which writes the embedded BlindBadge Skill directly into ai_agent's configured runtime Skill directory.
 ```
 
 ## BlindBadge Direct AI Loop Test
@@ -502,4 +502,100 @@ Conclusion:
 
 ```text
 The app now has a judge-friendly proactive alert demo. The near-obstacle AI response follows the required safety action.
+```
+
+## Runtime Skill, Fallback, And Action Simulation Test
+
+Test time: 2026-09-03 CST
+
+Build result:
+
+```text
+./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap --cmake -j2
+build completed successfully
+```
+
+Skill install command:
+
+```bash
+blind_badge_app install_skill
+```
+
+Observed result:
+
+```text
+[BlindBadge] skill_installed: /data/ai_agent/skills/blind-badge.md
+[BlindBadge] skill_title: BlindBadge Safety Reminder Skill
+[BlindBadge] skill_verify: run ai_agent, then ask /skill
+```
+
+Skill loader verification:
+
+```bash
+echo ask /skill | ai_agent
+```
+
+Observed result includes:
+
+```text
+[Agent]: - **BlindBadge Safety Reminder Skill**: ... (read with: read_file /data/ai_agent/skills/blind-badge.md)
+```
+
+This confirms the Skill is not only present in the repository; it is installed into the runtime path scanned by `ai_agent`.
+
+Standalone ai_agent behavior verification with MiMo configured at runtime:
+
+```bash
+ai_agent
+router_set mimo <MIMO_TOKEN_PLAN_KEY>
+ask BlindBadge event=obstacle_near distance_cm=40 direction=front
+```
+
+Observed result:
+
+```text
+Added [0]: mimo (mimo-v2.5, tier=1)
+Sent to agent: BlindBadge event=obstacle_near distance_cm=40 direction=front
+[Agent]: 正在分析...
+[Agent]: 前方40厘米有障碍物，请停下确认。
+```
+
+This confirms that a standalone `ai_agent` request can use the BlindBadge Skill context and produce one short safety-first reminder.
+
+Fallback test without a configured MiMo backend:
+
+```bash
+blind_badge_app demo --ai
+```
+
+Observed result shape:
+
+```text
+[BlindBadge] event: obstacle_near
+[BlindBadge] suggestion: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=80 direction=front...
+[BlindBadge] ai_error: no router backend at slot 0
+[BlindBadge] fallback_reason: no router backend at slot 0
+[BlindBadge] fallback_response: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] ai_response: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] severity: warn
+[BlindBadge] action.voice: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] action.vibration: short
+[BlindBadge] fallback: active
+```
+
+Emergency action result includes:
+
+```text
+[BlindBadge] severity: emergency
+[BlindBadge] action.voice: 我需要帮助，请联系我或前往我的当前位置。
+[BlindBadge] action.vibration: strong
+[BlindBadge] action.emergency_send: triggered
+[BlindBadge] fallback: active
+```
+
+Conclusion:
+
+```text
+The current demo has a deterministic local safety fallback, one-sentence AI response normalization, runtime Skill installation, and simulated execution actions for voice, vibration, and emergency-send behavior.
 ```

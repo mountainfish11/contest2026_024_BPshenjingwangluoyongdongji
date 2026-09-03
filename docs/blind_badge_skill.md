@@ -16,10 +16,12 @@ The Skill tells `ai_agent` how to answer BlindBadge safety events as a constrain
 
 ## Runtime Location
 
-`ai_agent` loads runtime Skill files from:
+`ai_agent` loads runtime Skill files from `AGENT_SKILLS_DIR`, which is built from `CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR`.
+
+In the verified `goldfish-arm64-v8a-ap` QEMU image this resolves to:
 
 ```text
-/data/agent/skills/*.md
+/data/ai_agent/skills/*.md
 ```
 
 The loader scans this directory and injects a summary into the Agent context. The first line of each file is used as the Skill title, so the BlindBadge Skill starts directly with:
@@ -32,34 +34,42 @@ Do not add YAML frontmatter before the title for this runtime Skill, otherwise t
 
 ## Install Method
 
-`ai_agent` provides:
+BlindBadge provides an offline installer command so the demo does not depend on GitHub, adb, or an HTTPS download during QEMU judging:
 
 ```bash
-install_skill <name> <https-url>
+blind_badge_app install_skill
 ```
 
-The current implementation downloads the Markdown file from an HTTPS URL and writes it to:
+It writes the embedded BlindBadge Skill to the same runtime directory used by `ai_agent`:
 
 ```text
-/data/agent/skills/<name>.md
+/data/ai_agent/skills/blind-badge.md
 ```
 
-After this repository is pushed, use the raw GitHub URL for the Skill file:
+Verify that `ai_agent` sees the Skill by sending `/skill` through the Agent CLI:
 
 ```bash
-install_skill blind-badge https://raw.githubusercontent.com/open-vela/contest2026_024_BPshenjingwangluoyongdongji/dev-ai-contest-2026/skills/blind-badge/SKILL.md
+echo ask /skill | ai_agent
 ```
 
-Then trigger or refresh Agent context by asking a BlindBadge event:
-
-```bash
-ask BlindBadge event obstacle_near distance_cm=80 direction=front
-```
-
-Expected style:
+Expected list entry:
 
 ```text
-前方约80厘米有障碍，请减速并小心绕行。
+- **BlindBadge Safety Reminder Skill**: ... (read with: read_file /data/ai_agent/skills/blind-badge.md)
+```
+
+Then validate behavior with a BlindBadge event:
+
+```bash
+ai_agent
+router_set mimo <MIMO_TOKEN_PLAN_KEY>
+ask BlindBadge event=obstacle_near distance_cm=40 direction=front
+```
+
+Verified QEMU response style:
+
+```text
+前方40厘米有障碍物，请停下确认。
 ```
 
 ## App Prompt Contract
@@ -74,12 +84,6 @@ BlindBadge event=emergency
 
 This keeps the event type explicit for `ai_agent` and gives the Skill a stable hook for judging danger level and response style.
 
-## Known Limitation
+## Headless QEMU Note
 
-Although the CLI help mentions `install_skill <name> <url|->`, the current source implementation only accepts HTTPS URLs. A local stdin install such as `install_skill blind-badge -` is rejected because the argument does not start with `https://`.
-
-This means QEMU Skill demo should use one of these methods:
-
-- install from a pushed raw HTTPS URL;
-- push/copy the file into `/data/agent/skills/` by another supported transport such as `adb push` when `adb` is available;
-- add a future project helper that copies the repository Skill into the Agent data directory.
+In the current headless serial workflow, starting `ai_agent` interactively can compete with the NSH console for stdin. For repeatable tests, pipe one command into `ai_agent` with `echo ask ... | ai_agent`, then interrupt with `Ctrl-C` after the Agent prints the response.

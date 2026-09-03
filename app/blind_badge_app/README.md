@@ -10,6 +10,8 @@ BlindBadge 的 openvela NSH 演示应用，映射到 `packages/demos/contest2026
 - `suggestion`: 本地确定性安全提醒；
 - `ai_prompt`: 发给 `ai_agent` / MiMo 的事件提示；
 - `ai_response`: 使用 `--ai` 时由 MiMo 返回的一句最终提醒。
+- `severity`: 本地危险等级；
+- `action.voice` / `action.vibration` / `action.emergency_send`: 模拟胸牌执行动作。
 
 ## 单事件命令
 
@@ -38,6 +40,17 @@ blind_badge_app obstacle 80 front --ai
 ```
 
 应用会内部调用 `ai_agent` 的 `llm_router` / `llm_proxy`，并打印 `ai_response`。
+
+如果 MiMo 未配置、超时、初始化失败或返回空内容，应用会打印 `ai_error`、`fallback_reason` 和 `fallback_response`，并继续使用本地安全提醒作为 `ai_response`。
+
+## Skill 安装验证
+
+```bash
+blind_badge_app install_skill
+echo ask /skill | ai_agent
+```
+
+`/skill` 输出中应包含 `BlindBadge Safety Reminder Skill`。当前 `goldfish-arm64-v8a-ap` 镜像的 `ai_agent` Skill 目录是 `/data/ai_agent/skills`，安装器直接复用 `ai_agent` 的 `AGENT_SKILLS_DIR` 配置。
 
 ## 主演示命令
 

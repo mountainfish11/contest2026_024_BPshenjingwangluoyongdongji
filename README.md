@@ -15,9 +15,11 @@ hazard event -> local safety rule -> ai_prompt -> ai_agent / MiMo -> final short
 ## Highlights
 
 - Proactive alert demo: one command simulates obstacles approaching from 120cm to 80cm to 40cm, then a downward step and emergency help.
-- Safety-first local fallback: every event has a deterministic `suggestion` even when the AI backend is unavailable.
+- Safety-first local fallback: every event has a deterministic `suggestion`, and `--ai` falls back locally when MiMo is unavailable, times out, or returns empty content.
 - AI loop verified in QEMU: `blind_badge_app --ai` calls the existing `ai_agent` `llm_router` and `llm_proxy` path.
 - Custom Skill: `skills/blind-badge/SKILL.md` defines BlindBadge-specific response rules for `obstacle_near`, `step_down`, and `emergency`.
+- Runtime Skill installer: `blind_badge_app install_skill` writes the Skill into the `ai_agent` runtime Skill directory for QEMU verification.
+- Execution action simulation: events print voice, vibration, and emergency-send actions based on severity.
 - Low-interruption output style: one short Chinese sentence, clear action, no long explanation, no absolute safety promise.
 
 ## Repository Layout
@@ -142,8 +144,19 @@ skills/blind-badge/SKILL.md
 Runtime ai_agent Skill location:
 
 ```text
-/data/agent/skills/*.md
+AGENT_SKILLS_DIR/*.md
 ```
+
+In the verified `goldfish-arm64-v8a-ap` QEMU image this is `/data/ai_agent/skills/*.md`.
+
+Install and verify inside QEMU:
+
+```bash
+blind_badge_app install_skill
+echo ask /skill | ai_agent
+```
+
+Expected `/skill` output includes `BlindBadge Safety Reminder Skill`.
 
 The Skill constrains BlindBadge responses to one short Chinese safety sentence and defines event-specific behavior:
 
@@ -151,7 +164,7 @@ The Skill constrains BlindBadge responses to one short Chinese safety sentence a
 - `step_down`: stop or slow down and confirm;
 - `emergency`: short help message for a contact or nearby helper.
 
-See `docs/blind_badge_skill.md` for install notes and current QEMU limitations.
+See `docs/blind_badge_skill.md` for install and verification notes.
 
 ## Verification
 
