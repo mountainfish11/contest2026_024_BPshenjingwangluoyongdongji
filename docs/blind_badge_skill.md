@@ -4,13 +4,15 @@
 
 ## Purpose
 
-The Skill tells `ai_agent` how to answer BlindBadge safety events:
+The Skill tells `ai_agent` how to answer BlindBadge safety events as a constrained safety-reminder assistant:
 
 - return exactly one short Chinese sentence;
 - prioritize immediate safety action;
+- keep the voice reminder low-interruption;
 - avoid long explanations;
 - avoid absolute safety promises;
-- use different wording for `obstacle_near`, `step_down`, and `emergency`.
+- use different wording for `obstacle_near`, `step_down`, and `emergency`;
+- follow the event priority `emergency > step_down > near obstacle > far obstacle`.
 
 ## Runtime Location
 
@@ -23,7 +25,7 @@ The Skill tells `ai_agent` how to answer BlindBadge safety events:
 The loader scans this directory and injects a summary into the Agent context. The first line of each file is used as the Skill title, so the BlindBadge Skill starts directly with:
 
 ```text
-# BlindBadge Safety Assistant
+# BlindBadge Safety Reminder Skill
 ```
 
 Do not add YAML frontmatter before the title for this runtime Skill, otherwise the current loader may summarize the title as `---`.
@@ -59,6 +61,18 @@ Expected style:
 ```text
 前方约80厘米有障碍，请减速并小心绕行。
 ```
+
+## App Prompt Contract
+
+`blind_badge_app` now emits structured prompt fragments that match this Skill:
+
+```text
+BlindBadge event=obstacle_near distance_cm=80 direction=front
+BlindBadge event=step_down direction=front
+BlindBadge event=emergency
+```
+
+This keeps the event type explicit for `ai_agent` and gives the Skill a stable hook for judging danger level and response style.
 
 ## Known Limitation
 

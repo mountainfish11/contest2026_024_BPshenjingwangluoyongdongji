@@ -49,6 +49,7 @@ static void print_help(void)
   printf("  blind_badge_app obstacle <distance_cm> <front|left|right> [--ai|--agent]\n");
   printf("  blind_badge_app step_down <front|left|right> [--ai|--agent]\n");
   printf("  blind_badge_app emergency [--ai|--agent]\n");
+  printf("  blind_badge_app demo [--ai|--agent]\n");
   printf("  --ai: call ai_agent LLM router directly and print ai_response\n");
   printf("  --agent: send ai_prompt to running ai_agent and wait for ai_response\n");
 }
@@ -201,7 +202,10 @@ static int ask_ai_direct(const char *ai_prompt)
 {
   const char *system_prompt =
     "你是盲人辅助胸牌的语音提醒模块。只输出一句简短中文提醒，"
-    "优先安全，不长篇解释，不承诺绝对安全。";
+    "优先安全，不长篇解释，不承诺绝对安全。"
+    "obstacle_near低于50厘米必须先提醒停下，50到99厘米提醒减速绕行，"
+    "100厘米及以上只提醒保持注意；step_down必须提醒停下或放慢并确认；"
+    "emergency输出适合联系人或附近人员的一句求助信息。";
   char messages_json[768];
   char response[BLIND_BADGE_RESPONSE_SIZE];
   int ret;
@@ -287,7 +291,8 @@ static int handle_obstacle(int argc, char *argv[],
 {
   int distance_cm;
   const char *direction;
-  char ai_prompt[256];
+  char ai_prompt[384];
+  const char *ai_action;
   int has_ai_flag = mode != BLIND_BADGE_AI_OFF;
 
   if (argc != (has_ai_flag ? 5 : 4))
@@ -319,24 +324,29 @@ static int handle_obstacle(int argc, char *argv[],
 
   if (distance_cm < 50)
     {
+      ai_action = "请先停下确认";
       printf("[BlindBadge] suggestion: %s%d厘米有障碍，请立即停下确认。\n",
              direction_zh(direction), distance_cm);
     }
   else if (distance_cm < 100)
     {
+      ai_action = "请减速并绕行";
       printf("[BlindBadge] suggestion: %s%d厘米有障碍，请减速并绕行。\n",
              direction_zh(direction), distance_cm);
     }
   else
     {
+      ai_action = "请保持注意";
       printf("[BlindBadge] suggestion: %s检测到较远障碍，请保持注意。\n",
              direction_zh(direction));
     }
 
   snprintf(ai_prompt, sizeof(ai_prompt),
+           "BlindBadge event=obstacle_near distance_cm=%d direction=%s。"
            "你是盲人辅助胸牌。检测到%s%d厘米有障碍，请生成一句简短安全提醒。"
-           "只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。",
-           direction_zh(direction), distance_cm);
+           "必须包含动作：%s。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。",
+           distance_cm, direction, direction_zh(direction), distance_cm,
+           ai_action);
   printf("[BlindBadge] ai_prompt: %s\n", ai_prompt);
 
   return run_ai_mode(mode, ai_prompt);
@@ -346,7 +356,7 @@ static int handle_step_down(int argc, char *argv[],
                             enum blind_badge_ai_mode mode)
 {
   const char *direction;
-  char ai_prompt[256];
+  char ai_prompt[384];
   int has_ai_flag = mode != BLIND_BADGE_AI_OFF;
 
   if (argc != (has_ai_flag ? 4 : 3))
@@ -370,9 +380,10 @@ static int handle_step_down(int argc, char *argv[],
   printf("[BlindBadge] suggestion: %s可能有下行台阶，请停一下，用手杖或脚尖确认。\n",
          direction_zh(direction));
   snprintf(ai_prompt, sizeof(ai_prompt),
+           "BlindBadge event=step_down direction=%s。"
            "你是盲人辅助胸牌。检测到%s可能有下行台阶，请生成一句简短安全提醒。"
-           "只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。",
-           direction_zh(direction));
+           "必须提醒停下或放慢并确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。",
+           direction, direction_zh(direction));
   printf("[BlindBadge] ai_prompt: %s\n", ai_prompt);
 
   return run_ai_mode(mode, ai_prompt);
@@ -381,6 +392,7 @@ static int handle_step_down(int argc, char *argv[],
 static int handle_emergency(int argc, enum blind_badge_ai_mode mode)
 {
   const char *ai_prompt =
+    "BlindBadge event=emergency。"
     "你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。"
     "只输出一句简短求助信息，不长篇解释，不承诺绝对安全。";
 
@@ -398,6 +410,107 @@ static int handle_emergency(int argc, enum blind_badge_ai_mode mode)
   printf("[BlindBadge] ai_prompt: %s\n", ai_prompt);
 
   return run_ai_mode(mode, ai_prompt);
+}
+
+static int demo_run_obstacle(int distance_cm, const char *direction,
+                             enum blind_badge_ai_mode mode)
+{
+  char distance_arg[16];
+  char *argv_local[] =
+    {
+      "blind_badge_app",
+      "obstacle",
+      distance_arg,
+      (char *)direction
+    };
+  char *argv_ai[] =
+    {
+      "blind_badge_app",
+      "obstacle",
+      distance_arg,
+      (char *)direction,
+      mode == BLIND_BADGE_AI_DIRECT ? "--ai" : "--agent"
+    };
+
+  snprintf(distance_arg, sizeof(distance_arg), "%d", distance_cm);
+  return handle_obstacle(mode == BLIND_BADGE_AI_OFF ? 4 : 5,
+                         mode == BLIND_BADGE_AI_OFF ? argv_local : argv_ai,
+                         mode);
+}
+
+static int demo_run_step_down(const char *direction,
+                              enum blind_badge_ai_mode mode)
+{
+  char *argv_local[] =
+    {
+      "blind_badge_app",
+      "step_down",
+      (char *)direction
+    };
+  char *argv_ai[] =
+    {
+      "blind_badge_app",
+      "step_down",
+      (char *)direction,
+      mode == BLIND_BADGE_AI_DIRECT ? "--ai" : "--agent"
+    };
+
+  return handle_step_down(mode == BLIND_BADGE_AI_OFF ? 3 : 4,
+                          mode == BLIND_BADGE_AI_OFF ? argv_local : argv_ai,
+                          mode);
+}
+
+static int demo_run_emergency(enum blind_badge_ai_mode mode)
+{
+  return handle_emergency(mode == BLIND_BADGE_AI_OFF ? 2 : 3, mode);
+}
+
+static int handle_demo(int argc, enum blind_badge_ai_mode mode)
+{
+  int expected_argc = mode == BLIND_BADGE_AI_OFF ? 2 : 3;
+  int ret = 0;
+
+  if (argc != expected_argc)
+    {
+      printf("[BlindBadge] error: demo takes no arguments except --ai or --agent.\n");
+      print_help();
+      return 1;
+    }
+
+  printf("[BlindBadge] demo: proactive_hazard_alert\n");
+  printf("[BlindBadge] demo_stage: obstacle approaching from 120cm to 40cm\n");
+
+  if (demo_run_obstacle(120, "front", mode) != 0)
+    {
+      ret = 1;
+    }
+
+  printf("[BlindBadge] demo_stage: obstacle warning threshold 80cm\n");
+  if (demo_run_obstacle(80, "front", mode) != 0)
+    {
+      ret = 1;
+    }
+
+  printf("[BlindBadge] demo_stage: urgent obstacle threshold 40cm\n");
+  if (demo_run_obstacle(40, "front", mode) != 0)
+    {
+      ret = 1;
+    }
+
+  printf("[BlindBadge] demo_stage: downward step detected\n");
+  if (demo_run_step_down("front", mode) != 0)
+    {
+      ret = 1;
+    }
+
+  printf("[BlindBadge] demo_stage: emergency help message\n");
+  if (demo_run_emergency(mode) != 0)
+    {
+      ret = 1;
+    }
+
+  printf("[BlindBadge] demo: completed\n");
+  return ret;
 }
 
 int main(int argc, char *argv[])
@@ -435,6 +548,11 @@ int main(int argc, char *argv[])
   if (strcmp(argv[1], "emergency") == 0)
     {
       return handle_emergency(argc, mode);
+    }
+
+  if (strcmp(argv[1], "demo") == 0)
+    {
+      return handle_demo(argc, mode);
     }
 
   printf("[BlindBadge] error: unknown command: %s\n", argv[1]);

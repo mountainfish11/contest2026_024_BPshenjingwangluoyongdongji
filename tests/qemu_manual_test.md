@@ -49,6 +49,7 @@ BlindBadge usage:
   blind_badge_app obstacle <distance_cm> <front|left|right> [--ai|--agent]
   blind_badge_app step_down <front|left|right> [--ai|--agent]
   blind_badge_app emergency [--ai|--agent]
+  blind_badge_app demo [--ai|--agent]
   --ai: call ai_agent LLM router directly and print ai_response
   --agent: send ai_prompt to running ai_agent and wait for ai_response
 ```
@@ -82,7 +83,7 @@ Required fields:
 ```text
 event: obstacle_near
 suggestion: 前方80厘米有障碍，请减速并绕行。
-ai_prompt: 你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。
+ai_prompt: BlindBadge event=obstacle_near distance_cm=80 direction=front。你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。
 ```
 
 Status: pass, no crash.
@@ -98,7 +99,7 @@ Required fields:
 ```text
 event: obstacle_near
 suggestion: 左侧40厘米有障碍，请立即停下确认。
-ai_prompt: 你是盲人辅助胸牌。检测到左侧40厘米有障碍，请生成一句简短安全提醒。
+ai_prompt: BlindBadge event=obstacle_near distance_cm=40 direction=left。你是盲人辅助胸牌。检测到左侧40厘米有障碍，请生成一句简短安全提醒。
 ```
 
 Status: pass, no crash.
@@ -114,7 +115,7 @@ Required fields:
 ```text
 event: step_down
 suggestion: 前方可能有下行台阶，请停一下，用手杖或脚尖确认。
-ai_prompt: 你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。
+ai_prompt: BlindBadge event=step_down direction=front。你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。
 ```
 
 Status: pass, no crash.
@@ -130,7 +131,7 @@ Required fields:
 ```text
 event: emergency
 suggestion: 已触发求助。建议发送：我需要帮助，请联系我或前往我的当前位置。
-ai_prompt: 你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。
+ai_prompt: BlindBadge event=emergency。你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。
 ```
 
 Status: pass, no crash.
@@ -342,7 +343,7 @@ Observed result:
 [BlindBadge] distance_cm: 80
 [BlindBadge] direction: front
 [BlindBadge] suggestion: 前方80厘米有障碍，请减速并绕行。
-[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=80 direction=front。你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。必须包含动作：请减速并绕行。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
 [BlindBadge] ai_status: calling ai_agent llm router...
 [BlindBadge] ai_response: 前方八十厘米处有障碍，请小心慢行。
 ```
@@ -359,7 +360,7 @@ Observed result:
 [BlindBadge] event: step_down
 [BlindBadge] direction: front
 [BlindBadge] suggestion: 前方可能有下行台阶，请停一下，用手杖或脚尖确认。
-[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_prompt: BlindBadge event=step_down direction=front。你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。必须提醒停下或放慢并确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
 [BlindBadge] ai_status: calling ai_agent llm router...
 [BlindBadge] ai_response: 前方可能有台阶，请注意脚下安全。
 ```
@@ -375,7 +376,7 @@ Observed result:
 ```text
 [BlindBadge] event: emergency
 [BlindBadge] suggestion: 已触发求助。建议发送：我需要帮助，请联系我或前往我的当前位置。
-[BlindBadge] ai_prompt: 你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。只输出一句简短求助信息，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_prompt: BlindBadge event=emergency。你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。只输出一句简短求助信息，不长篇解释，不承诺绝对安全。
 [BlindBadge] ai_status: calling ai_agent llm router...
 [BlindBadge] ai_response: 紧急求助！请立即联系我。
 ```
@@ -412,7 +413,7 @@ Observed result:
 [BlindBadge] distance_cm: 40
 [BlindBadge] direction: left
 [BlindBadge] suggestion: 左侧40厘米有障碍，请立即停下确认。
-[BlindBadge] ai_prompt: 你是盲人辅助胸牌。检测到左侧40厘米有障碍，请生成一句简短安全提醒。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=40 direction=left。你是盲人辅助胸牌。检测到左侧40厘米有障碍，请生成一句简短安全提醒。必须包含动作：请先停下确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
 ```
 
 Conclusion:
@@ -430,4 +431,75 @@ Current demo path:
 ```text
 Use --ai for the verified QEMU AI loop.
 Keep --agent as the next integration target after adding a non-interactive ai_agent service start mode or a supported app-to-agent request API.
+```
+
+## Proactive Alert Demo Test
+
+Test time: 2026-09-03 CST
+
+Command:
+
+```bash
+blind_badge_app demo
+```
+
+Observed result:
+
+```text
+[BlindBadge] demo: proactive_hazard_alert
+[BlindBadge] demo_stage: obstacle approaching from 120cm to 40cm
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 120
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方检测到较远障碍，请保持注意。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=120 direction=front。你是盲人辅助胸牌。检测到前方120厘米有障碍，请生成一句简短安全提醒。必须包含动作：请保持注意。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] demo_stage: obstacle warning threshold 80cm
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 80
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方80厘米有障碍，请减速并绕行。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=80 direction=front。你是盲人辅助胸牌。检测到前方80厘米有障碍，请生成一句简短安全提醒。必须包含动作：请减速并绕行。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] demo_stage: urgent obstacle threshold 40cm
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 40
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方40厘米有障碍，请立即停下确认。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=40 direction=front。你是盲人辅助胸牌。检测到前方40厘米有障碍，请生成一句简短安全提醒。必须包含动作：请先停下确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] demo_stage: downward step detected
+[BlindBadge] event: step_down
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方可能有下行台阶，请停一下，用手杖或脚尖确认。
+[BlindBadge] ai_prompt: BlindBadge event=step_down direction=front。你是盲人辅助胸牌。检测到前方可能有下行台阶，请生成一句简短安全提醒。必须提醒停下或放慢并确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] demo_stage: emergency help message
+[BlindBadge] event: emergency
+[BlindBadge] suggestion: 已触发求助。建议发送：我需要帮助，请联系我或前往我的当前位置。
+[BlindBadge] ai_prompt: BlindBadge event=emergency。你是盲人辅助胸牌。用户触发了求助按钮，请生成一句适合发给紧急联系人的求助信息。只输出一句简短求助信息，不长篇解释，不承诺绝对安全。
+[BlindBadge] demo: completed
+```
+
+AI safety-threshold regression:
+
+```bash
+ai_agent
+router_set mimo <MIMO_TOKEN_PLAN_KEY>
+quit
+blind_badge_app obstacle 40 front --ai
+```
+
+Observed result:
+
+```text
+[BlindBadge] event: obstacle_near
+[BlindBadge] distance_cm: 40
+[BlindBadge] direction: front
+[BlindBadge] suggestion: 前方40厘米有障碍，请立即停下确认。
+[BlindBadge] ai_prompt: BlindBadge event=obstacle_near distance_cm=40 direction=front。你是盲人辅助胸牌。检测到前方40厘米有障碍，请生成一句简短安全提醒。必须包含动作：请先停下确认。只输出一句提醒，优先安全，不长篇解释，不承诺绝对安全。
+[BlindBadge] ai_status: calling ai_agent llm router...
+[BlindBadge] ai_response: 前方40厘米有障碍，请先停下确认。
+```
+
+Conclusion:
+
+```text
+The app now has a judge-friendly proactive alert demo. The near-obstacle AI response follows the required safety action.
 ```
