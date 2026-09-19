@@ -85,13 +85,14 @@ PASS - these files are not needed for build, QEMU, Skill install, fallback, or A
 
 ## Secret Handling
 
-The real MiMo key must only be typed into QEMU at runtime:
+The real MiMo key must only be provided at runtime or through a local untracked build-only secret file:
 
 ```bash
 router_set mimo <MIMO_TOKEN_PLAN_KEY>
+ai_agent router_import_mimo
 ```
 
-Do not commit the real key.
+Do not commit the real key. For ESP32-S3-EYE validation, `router_import_mimo` may read `/data/agent/config/mimo.key` or a local ignored `ai_agent_local_secrets.h` file used only for a private firmware build.
 
 Status:
 
@@ -127,6 +128,22 @@ Expected:
 
 ```text
 MiMo returns one short safety reminder, or fallback keeps the safety loop alive if network/backend fails.
+```
+
+On ESP32-S3-EYE, if official long-key serial input is unreliable, use:
+
+```bash
+ai_agent router_import_mimo
+ai_agent ask hi
+blind_badge_app obstacle 40 front --ai --lcd
+```
+
+Expected:
+
+```text
+ai_agent ask hi returns a real MiMo response
+blind_badge_app prints ai_response without fallback: active
+LCD displays the final MiMo reminder text
 ```
 
 ## Pre-Submission Commands

@@ -157,11 +157,22 @@ Without MiMo configured, expected output includes:
 
 Configure the router in QEMU runtime only. Do not commit the real key.
 
+Preferred official path:
+
 ```bash
 ai_agent
 router_set mimo <MIMO_TOKEN_PLAN_KEY>
 ask BlindBadge event=obstacle_near distance_cm=40 direction=front
 ```
+
+ESP32-S3-EYE fallback path when long serial input is unstable:
+
+```bash
+ai_agent router_import_mimo
+ai_agent ask hi
+```
+
+`router_import_mimo` loads the key from `/data/agent/config/mimo.key` or from a local untracked build-only header. The command must not print the raw key.
 
 Expected shape:
 
@@ -224,3 +235,113 @@ Acceptance passes when:
 - emergency action triggers without AI;
 - MiMo returns a one-sentence safety reminder after runtime configuration;
 - `demo --ai` completes the proactive scenario.
+
+## 11. ESP32-S3-EYE Hardware Validation
+
+For the real-board validation record, see:
+
+- [ESP32-S3-EYE Hardware Validation Record](esp32_s3_eye_validation_2026-09-04.md)
+
+Validated hardware flow:
+
+```text
+ESP32-S3-EYE boot -> nsh> -> Wi-Fi/DNS -> ai_agent direct commands
+-> chunked MiMo key injection -> ai_agent ask hi
+-> blind_badge_app obstacle/emergency/demo --ai
+```
+
+## 12. ESP32-S3-EYE LCD Validation
+
+LCD is a judge/developer display path, not the primary blind-user output. Voice, vibration, buzzer, or emergency-send actions remain the product output.
+
+Run on the ESP32-S3-EYE `nsh>` prompt:
+
+```text
+blind_badge_app lcd_test
+```
+
+Expected LCD content:
+
+```text
+BlindBadge
+LCD OK
+```
+
+Check Chinese rendering:
+
+```text
+blind_badge_app lcd_test zh
+```
+
+Expected current result:
+
+```text
+前方障碍
+```
+
+Note: the firmware uses a limited built-in 16x16 CJK bitmap set for BlindBadge safety phrases. This is enough for the demo reminders, but it is not a full general-purpose Chinese font.
+
+Verify local event display:
+
+```text
+blind_badge_app obstacle 40 front --lcd
+```
+
+Expected LCD shape:
+
+```text
+BlindBadge
+DANGER / obstacle_near
+front 40cm
+stop first
+```
+
+Verify AI fallback display without MiMo:
+
+```text
+blind_badge_app obstacle 40 front --ai --lcd
+```
+
+Expected:
+
+```text
+[BlindBadge] fallback: active
+[BlindBadge] lcd: updated 240x240 bpp=16
+```
+
+LCD should show the final Chinese fallback reminder text, split across lines as needed:
+
+```text
+BlindBadge
+DANGER / AI Fallback
+前方40厘米有障碍
+请立即停下确认。
+```
+
+Verify emergency display without MiMo:
+
+```text
+blind_badge_app emergency --ai --lcd
+```
+
+Expected:
+
+```text
+[BlindBadge] severity: emergency
+[BlindBadge] action.vibration: strong
+[BlindBadge] action.emergency_send: triggered
+[BlindBadge] fallback: active
+[BlindBadge] lcd: updated 240x240 bpp=16
+```
+
+LCD should show the SOS/emergency state.
+
+Verify proactive display refresh:
+
+```text
+blind_badge_app demo --ai --lcd
+```
+
+Expected: LCD refreshes through the 120 cm, 80 cm, 40 cm, `step_down`, and `emergency` stages. If MiMo is unavailable, fallback must keep the flow running.
+
+The real MiMo key is not stored in the repository. It is injected at runtime with `ai_agent key_add <chunk>` and applied with `ai_agent router_set_key mimo`.

@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+out/
+*.o
+*.a
+*.elf
+*.hex
+*.map
+.built
+.depend
+Make.dep
+
+# Local editor and backup files
+*~
+*.bak
+*.swp
+
+# Local credentials and private firmware-only secret headers
+ai_agent_local_secrets.h
+*secret*
+*secrets*
+*.key
+*.pem
+
+# Local reference material that is not part of the contest submission package
+/asr_pro_e.pdf

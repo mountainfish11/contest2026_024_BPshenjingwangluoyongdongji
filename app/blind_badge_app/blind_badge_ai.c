@@ -5,22 +5,33 @@
 #include "blind_badge_ai.h"
 
 #include "blind_badge_policy.h"
+
+#include <nuttx/config.h>
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 #include "core/message_bus.h"
 #include "core/message_bus_tap.h"
 #include "infra/config_store.h"
+#include "infra/network_manager.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 
 #include <pthread.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 #include <time.h>
+#endif
 
 #define BLIND_BADGE_AGENT_CHANNEL "blind_badge"
 #define BLIND_BADGE_AGENT_CHAT_ID "badge_event"
 #define BLIND_BADGE_AGENT_TIMEOUT_MS 75000
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 struct blind_badge_agent_waiter
 {
   pthread_mutex_t lock;
@@ -56,6 +67,7 @@ static void add_timeout_ms(struct timespec *ts, int timeout_ms)
       ts->tv_nsec -= 1000000000L;
     }
 }
+#endif
 
 static int fallback_with_reason(const char *reason,
                                 const char *local_suggestion,
@@ -74,6 +86,7 @@ static int fallback_with_reason(const char *reason,
   return 0;
 }
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 static int ask_agent(const char *ai_prompt,
                      const char *local_suggestion,
                      char *response, size_t response_size,
@@ -229,6 +242,7 @@ static int ask_ai_direct(const char *ai_prompt,
 
   return 0;
 }
+#endif
 
 int blind_badge_ask_ai(enum blind_badge_ai_mode mode,
                        const char *ai_prompt,
@@ -241,16 +255,38 @@ int blind_badge_ask_ai(enum blind_badge_ai_mode mode,
       *used_fallback = 0;
     }
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  if ((mode == BLIND_BADGE_AI_DIRECT || mode == BLIND_BADGE_AI_AGENT) &&
+      !network_is_connected())
+    {
+      return fallback_with_reason("WiFi is not connected",
+                                  local_suggestion, response, response_size,
+                                  used_fallback);
+    }
+#endif
+
   if (mode == BLIND_BADGE_AI_DIRECT)
     {
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
       return ask_ai_direct(ai_prompt, local_suggestion, response,
                            response_size, used_fallback);
+#else
+      return fallback_with_reason("ai_agent not enabled in this build",
+                                  local_suggestion, response, response_size,
+                                  used_fallback);
+#endif
     }
 
   if (mode == BLIND_BADGE_AI_AGENT)
     {
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
       return ask_agent(ai_prompt, local_suggestion, response, response_size,
                        used_fallback);
+#else
+      return fallback_with_reason("ai_agent not enabled in this build",
+                                  local_suggestion, response, response_size,
+                                  used_fallback);
+#endif
     }
 
   blind_badge_fallback_response(local_suggestion, response, response_size);
@@ -261,4 +297,3 @@ int blind_badge_ask_ai(enum blind_badge_ai_mode mode,
 
   return 0;
 }
-

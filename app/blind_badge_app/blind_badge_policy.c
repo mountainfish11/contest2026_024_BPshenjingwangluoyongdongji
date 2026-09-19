@@ -12,11 +12,61 @@ static int is_sentence_end(char c)
   return c == '.' || c == '!' || c == '?' || c == '\n';
 }
 
+static size_t utf8_prefix_len(const char *s, size_t len)
+{
+  size_t i = 0;
+  size_t last_good = 0;
+
+  while (i < len)
+    {
+      unsigned char c = (unsigned char)s[i];
+      size_t need;
+
+      if ((c & 0x80) == 0)
+        {
+          need = 1;
+        }
+      else if ((c & 0xe0) == 0xc0)
+        {
+          need = 2;
+        }
+      else if ((c & 0xf0) == 0xe0)
+        {
+          need = 3;
+        }
+      else if ((c & 0xf8) == 0xf0)
+        {
+          need = 4;
+        }
+      else
+        {
+          break;
+        }
+
+      if (i + need > len)
+        {
+          break;
+        }
+
+      for (size_t j = 1; j < need; j++)
+        {
+          if (((unsigned char)s[i + j] & 0xc0) != 0x80)
+            {
+              return last_good;
+            }
+        }
+
+      i += need;
+      last_good = i;
+    }
+
+  return last_good;
+}
+
 static void copy_short_sentence(const char *input, char *buf, size_t buf_size)
 {
   size_t i;
   size_t max_copy;
-  int ended_at_punctuation = 0;
 
   if (buf_size == 0)
     {
@@ -41,7 +91,6 @@ static void copy_short_sentence(const char *input, char *buf, size_t buf_size)
       if (is_sentence_end(input[i]))
         {
           i++;
-          ended_at_punctuation = 1;
           break;
         }
 
@@ -56,7 +105,6 @@ static void copy_short_sentence(const char *input, char *buf, size_t buf_size)
               buf[i + 1] = input[i + 1];
               buf[i + 2] = input[i + 2];
               i += 3;
-              ended_at_punctuation = 1;
             }
           else
             {
@@ -66,11 +114,7 @@ static void copy_short_sentence(const char *input, char *buf, size_t buf_size)
         }
     }
 
-  while (!ended_at_punctuation && i > 0 &&
-         ((unsigned char)buf[i - 1] & 0xc0) == 0x80)
-    {
-      i--;
-    }
+  i = utf8_prefix_len(buf, i);
 
   buf[i] = '\0';
 }
