@@ -42,6 +42,28 @@ Status:
 PASS - defconfig enables blind_badge_app.
 ```
 
+## Hardware Workspace Dependencies
+
+QEMU reproduction is contained in this contest repository. ESP32-S3-EYE hardware reproduction additionally depends on local openvela workspace changes in:
+
+```text
+nuttx
+packages/ai_agent
+apps
+```
+
+The dependency file list and purpose are recorded in:
+
+```text
+docs/openvela_workspace_dependencies.md
+```
+
+Status:
+
+```text
+DOCUMENTED - public-repository deltas are listed for hardware review.
+```
+
 ## Runtime Skill Directory
 
 `blind_badge_app install_skill` creates the needed directories and writes to `AGENT_SKILLS_DIR`.

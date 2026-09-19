@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_024_BPshenjingwangluoyongdongji",
+  "github_login": "mountainfish11",
+  "generator": "codex-redacted-export",
+  "sessions": [
+    {
+      "session_id": "01a061ac-fd7f-7391-a53f-1bbeba7bb48a",
+      "tool": "codex",
+      "started_at": "2026-09-02T10:43:41.538Z",
+      "last_event_at": "2026-09-09T09:05:18.003Z",
+      "event_count": 14996,
+      "file_path": "logs/mountainfish11/2026-09-02/codex__01a061ac-fd7f-7391-a53f-1bbeba7bb48a.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "redaction": "credential-like values and encrypted reasoning content redacted before repository submission"
+    },
+    {
+      "session_id": "01a08521-4291-7aa2-9b8c-252e5e7b3806",
+      "tool": "codex",
+      "started_at": "2026-09-09T07:47:07.963Z",
+      "last_event_at": "2026-09-12T11:27:08.371Z",
+      "event_count": 10206,
+      "file_path": "logs/mountainfish11/2026-09-09/codex__01a08521-4291-7aa2-9b8c-252e5e7b3806.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "redaction": "credential-like values and encrypted reasoning content redacted before repository submission"
+    },
+    {
+      "session_id": "01a09e7f-a2b8-7dd0-93a2-e21e308d9f3b",
+      "tool": "codex",
+      "started_at": "2026-09-14T05:59:43.807Z",
+      "last_event_at": "2026-09-17T13:04:20.102Z",
+      "event_count": 3160,
+      "file_path": "logs/mountainfish11/2026-09-14/codex__01a09e7f-a2b8-7dd0-93a2-e21e308d9f3b.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "redaction": "credential-like values and encrypted reasoning content redacted before repository submission"
+    }
+  ],
+  "updated_at": "2026-09-19T21:30:00+08:00"
+}

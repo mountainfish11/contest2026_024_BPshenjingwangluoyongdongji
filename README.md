@@ -54,6 +54,8 @@ Verified result:
 build completed successfully
 ```
 
+Hardware note: the QEMU demo is contained in this contest repository. The ESP32-S3-EYE hardware demo also uses local workspace changes in `nuttx`, `packages/ai_agent`, and `apps`; see `docs/openvela_workspace_dependencies.md`.
+
 ## Run In QEMU
 
 Use headless mode in this environment:
@@ -179,6 +181,7 @@ docs/demo_script_3min.md
 docs/hardware_plan_esp32_s3_eye.md
 docs/clean_reproduction_check.md
 docs/final_submission_materials.md
+docs/openvela_workspace_dependencies.md
 ```
 
 Manual verification is recorded in:

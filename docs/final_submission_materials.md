@@ -48,6 +48,10 @@ Use this page as the submission index for BlindBadge.
 
    Event protocol direction for later sensor integration.
 
+11. `docs/openvela_workspace_dependencies.md`
+
+   Extra `nuttx`, `packages/ai_agent`, and `apps` workspace changes used by the ESP32-S3-EYE hardware validation path.
+
 ## Key Demo Commands
 
 ```bash
