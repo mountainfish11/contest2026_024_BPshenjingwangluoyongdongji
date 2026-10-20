@@ -127,7 +127,7 @@ Current diff size:
 
 For QEMU review, judges can use the contest repository and `contest2026_024_BPshenjingwangluoyongdongji.xml`.
 
-For ESP32-S3-EYE hardware review, apply or review the workspace deltas above before building from `/home/GGB/openvela/nuttx`. The hardware validation document records the validated runtime path:
+For ESP32-S3-EYE hardware review, apply or review the workspace deltas above before building from `/home/mountainfish/openvela/nuttx`. The hardware validation document records the validated runtime path:
 
 ```text
 ESP32-S3-EYE boot -> nsh> -> Wi-Fi/DNS -> ai_agent direct commands

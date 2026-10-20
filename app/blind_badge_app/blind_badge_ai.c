@@ -257,7 +257,7 @@ int blind_badge_ask_ai(enum blind_badge_ai_mode mode,
 
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
   if ((mode == BLIND_BADGE_AI_DIRECT || mode == BLIND_BADGE_AI_AGENT) &&
-      !network_is_connected())
+      network_wait_connected(3000) != OK)
     {
       return fallback_with_reason("WiFi is not connected",
                                   local_suggestion, response, response_size,

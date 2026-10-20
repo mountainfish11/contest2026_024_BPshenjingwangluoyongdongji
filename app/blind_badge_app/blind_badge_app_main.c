@@ -6,11 +6,19 @@
 #include "blind_badge_ai.h"
 #include "blind_badge_display.h"
 #include "blind_badge_event.h"
+#include "blind_badge_fall.h"
 #include "blind_badge_policy.h"
 #include "blind_badge_skill.h"
+#include "blind_badge_state.h"
+#include "qma7981.h"
 #include "uart_link.h"
 
 #include <nuttx/config.h>
+#include <nuttx/sched.h>
+
+#ifdef CONFIG_INPUT_BUTTONS
+#  include <nuttx/input/buttons.h>
+#endif
 
 #ifdef CONFIG_SYSTEM_NXRECORDER
 #  include <nuttx/audio/audio.h>
@@ -21,27 +29,37 @@
 #  include "channels/nsh_commands.h"
 #  include "infra/network_manager.h"
 #  include "voice/voice_asr.h"
+#  include "voice/volc_asr.h"
 #endif
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
 #define BLIND_BADGE_TEXT_SIZE 512
-#define BLIND_BADGE_WIFI_UI_TIMEOUT_SECONDS 12
+#define BLIND_BADGE_WIFI_UI_TIMEOUT_SECONDS 60
+#define BLIND_BADGE_WIFI_BOOT_RETRIES 3
 #define BLIND_BADGE_MIC_DEVICE "/dev/audio/pcm_in0"
 #define BLIND_BADGE_NXRECORDER_IDLE 0
 #define BLIND_BADGE_MIC_DEFAULT_FILE "/tmp/mic.pcm"
 #define BLIND_BADGE_MIC_DEFAULT_SECONDS 3
 #define BLIND_BADGE_MIC_MAX_SECONDS 30
+#define BLIND_BADGE_MIC_WARMUP_SAMPLES 1600
 #define BLIND_BADGE_VOICE_AI_DEFAULT_SECONDS 3
 #define BLIND_BADGE_VOICE_AI_MAX_SECONDS 4
 #define BLIND_BADGE_VOICE_AI_PCM_FILE "/tmp/voice_ai_16bit.pcm"
+#define BLIND_BADGE_BUTTON_DEVICE "/dev/buttons"
+#define BLIND_BADGE_BUTTON_POLL_MS 20
+#define BLIND_BADGE_BUTTON_DOUBLE_MS 350
+#define BLIND_BADGE_BUTTON_LONG_MS 1500
+#define BLIND_BADGE_BUTTON_VOICE_STACK_SIZE 16384
 
 struct blind_badge_cli_options
 {
@@ -61,14 +79,22 @@ static void print_help(void)
   printf("  blind_badge_app demo [--ai|--agent] [--lcd]\n");
   printf("  blind_badge_app boot_display\n");
   printf("  blind_badge_app boot_timeout\n");
+  printf("  blind_badge_app state [STATE]\n");
+  printf("  blind_badge_app button_service|button_stop|button_status\n");
   printf("  blind_badge_app lcd_test [zh]\n");
   printf("  blind_badge_app mic_record [seconds] [16bit_pcm_file]\n");
   printf("  blind_badge_app mic_stats <16bit_pcm_file>\n");
   printf("  blind_badge_app mic_dump <16bit_pcm_file> [max_bytes]\n");
+  printf("  blind_badge_app voice_asr [seconds] [--lcd]\n");
   printf("  blind_badge_app voice_ai [seconds] [--ai|--agent] [--lcd]\n");
   printf("  blind_badge_app voice_ai_text <recognized_text...> [--ai|--agent]\n");
   printf("  blind_badge_app install_skill\n");
+  printf("  blind_badge_app fall_start [--ai|--agent] [--lcd]\n");
+  printf("  blind_badge_app fall_stop\n");
+  printf("  blind_badge_app fall_status\n");
+  printf("  blind_badge_app fall_read\n");
   printf("  blind_badge_app uart_link_start|uart_link_stop|uart_link_status\n");
+  printf("  blind_badge_app uart_link_send <UPPERCASE_FLAG>\n");
   printf("  --ai: call ai_agent LLM router directly and print ai_response\n");
   printf("  --agent: send ai_prompt to running ai_agent and wait for ai_response\n");
   printf("  --lcd: enable LCD explicitly (default with framebuffer builds)\n");
@@ -247,11 +273,12 @@ static int handle_mic_dump(int argc, char *argv[])
   return dump_mic_pcm_hex(argv[2], max_bytes);
 }
 
-static int record_mic_16bit_file(const char *path, long seconds)
+static int record_mic_raw_file(const char *path, long seconds, int bits)
 {
 #ifdef CONFIG_SYSTEM_NXRECORDER
   struct nxrecorder_s *recorder;
   uint32_t limit_bytes;
+  uint32_t captured_bytes;
   int elapsed_ms = 0;
   int timeout_ms;
   int ret;
@@ -272,12 +299,13 @@ static int record_mic_16bit_file(const char *path, long seconds)
       return 1;
     }
 
-  limit_bytes = seconds * 16000 * 2;
+  limit_bytes = (seconds * 16000 + BLIND_BADGE_MIC_WARMUP_SAMPLES) *
+                (bits / 8);
   recorder->record_limit_bytes = limit_bytes;
   recorder->record_bytes = 0;
 
   ret = nxrecorder_recordinternal(recorder, path, AUDIO_FMT_PCM,
-                                  1, 16, 16000, 0);
+                                  1, bits, 16000, 0);
   if (ret < 0)
     {
       printf("[BlindBadge] mic_record: start failed (%d).\n", ret);
@@ -286,7 +314,7 @@ static int record_mic_16bit_file(const char *path, long seconds)
     }
 
   printf("[BlindBadge] mic_record: recording %ld second(s), "
-         "mono 16000 Hz 16-bit raw PCM -> %s\n", seconds, path);
+         "mono 16000 Hz %d-bit raw PCM -> %s\n", seconds, bits, path);
 
   printf("[BlindBadge] mic_record: waiting for %lu byte(s).\n",
          (unsigned long)limit_bytes);
@@ -328,16 +356,117 @@ static int record_mic_16bit_file(const char *path, long seconds)
          (unsigned long)limit_bytes,
          recorder->state);
 
+  captured_bytes = recorder->record_bytes;
   nxrecorder_release(recorder);
 
+  if (captured_bytes < limit_bytes)
+    {
+      printf("[BlindBadge] mic_record: incomplete capture; refusing ASR.\n");
+      return 1;
+    }
+
   printf("[BlindBadge] mic_record: complete.\n");
-  return print_mic_stats_limited(path, seconds * 16000);
+  return 0;
 #else
   (void)path;
   (void)seconds;
   printf("[BlindBadge] mic_record: CONFIG_SYSTEM_NXRECORDER is disabled.\n");
   return 1;
 #endif
+}
+
+static int record_mic_16bit_file(const char *path, long seconds)
+{
+  uint32_t samples[256];
+  uint16_t pcm[256];
+  size_t count;
+  size_t total = 0;
+  size_t i;
+  FILE *input;
+  FILE *output;
+  char *raw_path;
+  int ret;
+
+  raw_path = malloc(strlen(path) + sizeof(".i2s32"));
+  if (raw_path == NULL)
+    {
+      return 1;
+    }
+
+  sprintf(raw_path, "%s.i2s32", path);
+  ret = record_mic_raw_file(raw_path, seconds, 32);
+  if (ret != 0)
+    {
+      unlink(raw_path);
+      free(raw_path);
+      return ret;
+    }
+
+  input = fopen(raw_path, "rb");
+  if (input != NULL &&
+      fseek(input, BLIND_BADGE_MIC_WARMUP_SAMPLES * sizeof(uint32_t),
+            SEEK_SET) != 0)
+    {
+      fclose(input);
+      input = NULL;
+    }
+
+  output = input != NULL ? fopen(path, "wb") : NULL;
+  if (output == NULL)
+    {
+      if (input != NULL)
+        {
+          fclose(input);
+        }
+
+      unlink(raw_path);
+      free(raw_path);
+      return 1;
+    }
+
+  /* Discard the microphone's first 100 ms to exclude its startup transient.
+   * The microphone supplies MSB-aligned samples in 32-bit I2S slots.
+   * Keep the signed high 16 bits for little-endian ASR PCM.
+   */
+
+  while ((count = fread(samples, sizeof(samples[0]), 256, input)) > 0)
+    {
+      for (i = 0; i < count; i++)
+        {
+          pcm[i] = (uint16_t)(samples[i] >> 16);
+        }
+
+      if (fwrite(pcm, sizeof(pcm[0]), count, output) != count)
+        {
+          ret = 1;
+          break;
+        }
+
+      total += count;
+    }
+
+  if (ferror(input) || total != (size_t)seconds * 16000)
+    {
+      ret = 1;
+    }
+
+  fclose(input);
+  if (fclose(output) != 0)
+    {
+      ret = 1;
+    }
+
+  unlink(raw_path);
+  free(raw_path);
+  if (ret != 0)
+    {
+      printf("[BlindBadge] mic_record: 32-to-16-bit conversion failed.\n");
+      return ret;
+    }
+
+  printf("[BlindBadge] mic_record: converted %lu samples to 16-bit PCM.\n",
+         (unsigned long)total);
+  return print_mic_stats_limited(path, seconds * 16000);
 }
 
 static int handle_mic_record(int argc, char *argv[])
@@ -468,6 +597,7 @@ static int run_voice_ai_text(const char *recognized_text,
 
   printf("[BlindBadge] asr_text: %s\n", recognized_text);
   printf("[BlindBadge] ai_prompt: %s\n", prompt);
+  blind_badge_state_set(BLIND_BADGE_STATE_PROCESSING, "voice request");
 
   if (options->use_lcd)
     {
@@ -479,10 +609,13 @@ static int run_voice_ai_text(const char *recognized_text,
                            sizeof(response), &used_fallback);
   if (ret != 0)
     {
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "voice AI failed");
       return ret;
     }
 
   printf("[BlindBadge] ai_response: %s\n", response);
+  blind_badge_state_set(BLIND_BADGE_STATE_RESULT,
+                        used_fallback ? "local fallback" : "voice reply");
   if (options->use_lcd)
     {
       ai_agent_display_ask_result(response, used_fallback ? 0 : 1);
@@ -508,7 +641,8 @@ static int handle_voice_ai_text(int argc, char *argv[],
   return run_voice_ai_text(recognized_text, options);
 }
 
-static int parse_voice_ai_seconds(int argc, char *argv[], long *seconds)
+static int parse_voice_seconds(const char *command, int argc, char *argv[],
+                               long *seconds)
 {
   int value_seen = 0;
   int i;
@@ -529,8 +663,8 @@ static int parse_voice_ai_seconds(int argc, char *argv[], long *seconds)
 
       if (value_seen)
         {
-          printf("[BlindBadge] error: voice_ai accepts only one optional "
-                 "seconds argument.\n");
+          printf("[BlindBadge] error: %s accepts only one optional "
+                 "seconds argument.\n", command);
           return -EINVAL;
         }
 
@@ -539,8 +673,8 @@ static int parse_voice_ai_seconds(int argc, char *argv[], long *seconds)
       if (errno != 0 || *argv[i] == '\0' || *end != '\0' ||
           value < 1 || value > BLIND_BADGE_VOICE_AI_MAX_SECONDS)
         {
-          printf("[BlindBadge] error: voice_ai seconds must be 1..%d.\n",
-                 BLIND_BADGE_VOICE_AI_MAX_SECONDS);
+          printf("[BlindBadge] error: %s seconds must be 1..%d.\n",
+                 command, BLIND_BADGE_VOICE_AI_MAX_SECONDS);
           return -EINVAL;
         }
 
@@ -618,13 +752,35 @@ static int load_16bit_pcm(const char *path, long seconds,
   return OK;
 }
 
-static int run_voice_ai_from_pcm_file(long seconds,
-                                      const struct blind_badge_cli_options *options)
+static int run_voice_asr_from_pcm_file(long seconds,
+                                       const struct blind_badge_cli_options *options,
+                                       char *asr_text, size_t asr_text_size)
 {
   unsigned char *pcm = NULL;
   size_t pcm_len = 0;
-  char asr_text[BLIND_BADGE_TEXT_SIZE];
   int ret;
+
+  if (asr_text == NULL || asr_text_size == 0)
+    {
+      return 1;
+    }
+
+  if (voice_asr_get_backend() == NULL)
+    {
+      ret = volc_asr_register();
+      if (ret < 0)
+        {
+          printf("[BlindBadge] voice_ai: cannot register ASR backend (%d).\n",
+                 ret);
+          blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
+                                "ASR backend unavailable");
+          return 1;
+        }
+    }
+
+  printf("[BlindBadge] voice_ai: ASR backend=%s.\n",
+         voice_asr_get_backend());
+  blind_badge_state_set(BLIND_BADGE_STATE_RECORDING, "microphone active");
 
   if (options->use_lcd)
     {
@@ -635,6 +791,7 @@ static int run_voice_ai_from_pcm_file(long seconds,
   ret = record_mic_16bit_file(BLIND_BADGE_VOICE_AI_PCM_FILE, seconds);
   if (ret != 0)
     {
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "recording failed");
       if (options->use_lcd)
         {
           blind_badge_display_show_lines("VOICE", "REC ERROR",
@@ -649,11 +806,14 @@ static int run_voice_ai_from_pcm_file(long seconds,
                                      "ASR running", "");
     }
 
+  blind_badge_state_set(BLIND_BADGE_STATE_PROCESSING, "speech recognition");
+
   ret = load_16bit_pcm(BLIND_BADGE_VOICE_AI_PCM_FILE, seconds,
                        &pcm, &pcm_len);
   if (ret < 0)
     {
       printf("[BlindBadge] voice_ai: PCM conversion failed (%d).\n", ret);
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "PCM conversion failed");
       if (options->use_lcd)
         {
           blind_badge_display_show_lines("VOICE", "PCM ERROR",
@@ -665,16 +825,39 @@ static int run_voice_ai_from_pcm_file(long seconds,
   asr_text[0] = '\0';
   printf("[BlindBadge] voice_ai: calling ASR backend with %zu bytes.\n",
          pcm_len);
-  ret = voice_asr_recognize(pcm, pcm_len, asr_text, sizeof(asr_text));
+  ret = voice_asr_recognize(pcm, pcm_len, asr_text, asr_text_size);
   free(pcm);
 
   if (ret < 0)
     {
       printf("[BlindBadge] voice_ai: ASR failed (%d).\n", ret);
+      if (ret == -ECONNREFUSED)
+        {
+          printf("[BlindBadge] voice_asr: cannot connect to ASR server; "
+                 "check DNS, port 443, and proxy settings.\n");
+        }
+      else if (ret == -ENOENT)
+        {
+          printf("[BlindBadge] voice_asr: ASR credentials are not set.\n");
+        }
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "ASR failed");
       if (options->use_lcd)
         {
-          blind_badge_display_show_lines("VOICE", "ASR ERROR",
-                                         "check ASR key/net", "");
+          if (ret == -ENODATA)
+            {
+              blind_badge_display_show_lines("VOICE", "NO SPEECH",
+                                             "Please try again", "");
+            }
+          else if (ret == -ECONNREFUSED || ret == -EIO)
+            {
+              blind_badge_display_show_lines("VOICE", "NETWORK ERROR",
+                                             "Please try again", "");
+            }
+          else
+            {
+              blind_badge_display_show_lines("VOICE", "ASR ERROR",
+                                             "check ASR key/net", "");
+            }
         }
       return 1;
     }
@@ -682,6 +865,7 @@ static int run_voice_ai_from_pcm_file(long seconds,
   if (asr_text[0] == '\0')
     {
       printf("[BlindBadge] voice_ai: ASR returned empty text.\n");
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "ASR returned empty");
       if (options->use_lcd)
         {
           blind_badge_display_show_lines("VOICE", "ASR EMPTY",
@@ -690,18 +874,51 @@ static int run_voice_ai_from_pcm_file(long seconds,
       return 1;
     }
 
-  return run_voice_ai_text(asr_text, options);
+  printf("[BlindBadge] asr_text: %s\n", asr_text);
+  blind_badge_state_set(BLIND_BADGE_STATE_RESULT, "speech recognized");
+  if (options->use_lcd)
+    {
+      blind_badge_display_show_lines("VOICE", "RECOGNIZED", asr_text, "");
+    }
+
+  return 0;
 }
 #endif
+
+static int handle_voice_asr(int argc, char *argv[],
+                            const struct blind_badge_cli_options *options)
+{
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  char asr_text[BLIND_BADGE_TEXT_SIZE];
+  long seconds;
+
+  if (parse_voice_seconds("voice_asr", argc, argv, &seconds) < 0)
+    {
+      return 1;
+    }
+
+  printf("[BlindBadge] voice_asr: press accepted; speak for %ld second(s).\n",
+         seconds);
+  return run_voice_asr_from_pcm_file(seconds, options, asr_text,
+                                     sizeof(asr_text));
+#else
+  (void)argc;
+  (void)argv;
+  (void)options;
+  printf("[BlindBadge] voice_asr: CONFIG_EXAMPLES_AI_AGENT_VELA is disabled.\n");
+  return 1;
+#endif
+}
 
 static int handle_voice_ai(int argc, char *argv[],
                            const struct blind_badge_cli_options *options)
 {
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
   long seconds;
+  char asr_text[BLIND_BADGE_TEXT_SIZE];
   int ret;
 
-  ret = parse_voice_ai_seconds(argc, argv, &seconds);
+  ret = parse_voice_seconds("voice_ai", argc, argv, &seconds);
   if (ret < 0)
     {
       return 1;
@@ -716,7 +933,14 @@ static int handle_voice_ai(int argc, char *argv[],
   printf("[BlindBadge] voice_ai: recording %ld second(s), "
          "then ASR -> AI -> LCD.\n", seconds);
   printf("[BlindBadge] voice_ai: using ESP32-S3-EYE 16-bit PCM capture.\n");
-  return run_voice_ai_from_pcm_file(seconds, options);
+  ret = run_voice_asr_from_pcm_file(seconds, options, asr_text,
+                                    sizeof(asr_text));
+  if (ret != 0)
+    {
+      return ret;
+    }
+
+  return run_voice_ai_text(asr_text, options);
 #else
   (void)argc;
   (void)argv;
@@ -815,6 +1039,17 @@ static int run_event(struct blind_badge_event *event,
   char ai_response[BLIND_BADGE_TEXT_SIZE];
   int used_fallback = 0;
 
+  if (event->type == BLIND_BADGE_EVENT_EMERGENCY)
+    {
+      blind_badge_state_set(BLIND_BADGE_STATE_EMERGENCY,
+                            "emergency event");
+    }
+  else
+    {
+      blind_badge_state_set(BLIND_BADGE_STATE_PROCESSING,
+                            blind_badge_event_name(event->type));
+    }
+
   blind_badge_apply_policy(event);
   blind_badge_build_local_suggestion(event, suggestion, sizeof(suggestion));
   blind_badge_build_ai_prompt(event, ai_prompt, sizeof(ai_prompt));
@@ -838,7 +1073,93 @@ static int run_event(struct blind_badge_event *event,
       print_event_ai_result(event, ai_response, used_fallback,
                             options->use_lcd);
     }
+  else
+    {
+      strncpy(ai_response, suggestion, sizeof(ai_response) - 1);
+      ai_response[sizeof(ai_response) - 1] = '\0';
+      print_event_ai_result(event, ai_response, 1, options->use_lcd);
+    }
+
+  if (event->type != BLIND_BADGE_EVENT_EMERGENCY)
+    {
+      blind_badge_state_set(BLIND_BADGE_STATE_RESULT,
+                            blind_badge_event_name(event->type));
+      if (options->use_lcd)
+        {
+          blind_badge_display_show_ai_event(event, ai_response,
+                                            used_fallback ||
+                                            options->ai_mode ==
+                                            BLIND_BADGE_AI_OFF);
+        }
+    }
   return 0;
+}
+
+static void handle_uart_link_event(const struct uart_link_event *link_event,
+                                   void *arg)
+{
+  struct blind_badge_cli_options options =
+    {
+      .ai_mode = BLIND_BADGE_AI_OFF,
+#ifdef CONFIG_VIDEO_FB
+      .use_lcd = 1,
+#else
+      .use_lcd = 0,
+#endif
+      .option_count = 0
+    };
+  struct blind_badge_event event =
+    {
+      .type = BLIND_BADGE_EVENT_STATUS,
+      .direction = BLIND_BADGE_DIR_UNKNOWN,
+      .severity = BLIND_BADGE_SEVERITY_INFO,
+      .distance_cm = 0
+    };
+
+  (void)arg;
+  if (link_event == NULL)
+    {
+      return;
+    }
+
+  switch (link_event->type)
+    {
+      case UART_LINK_EVENT_OBSTACLE:
+        event.type = BLIND_BADGE_EVENT_OBSTACLE;
+        event.distance_cm = link_event->distance_cm;
+        if (blind_badge_parse_direction(link_event->direction,
+                                        &event.direction) != 0)
+          {
+            printf("[BlindBadge] uart_event: invalid direction=%s\n",
+                   link_event->direction);
+            return;
+          }
+        break;
+
+      case UART_LINK_EVENT_STEP_DOWN:
+        event.type = BLIND_BADGE_EVENT_STEP_DOWN;
+        if (blind_badge_parse_direction(link_event->direction,
+                                        &event.direction) != 0)
+          {
+            printf("[BlindBadge] uart_event: invalid direction=%s\n",
+                   link_event->direction);
+            return;
+          }
+        break;
+
+      case UART_LINK_EVENT_EMERGENCY:
+        event.type = BLIND_BADGE_EVENT_EMERGENCY;
+        event.severity = BLIND_BADGE_SEVERITY_EMERGENCY;
+        break;
+
+      default:
+        return;
+    }
+
+  printf("[BlindBadge] uart_event: confidence=%d source=%s\n",
+         link_event->confidence,
+         link_event->source[0] != '\0' ? link_event->source : "sub_board");
+  run_event(&event, &options);
 }
 
 static int handle_status(int argc, const struct blind_badge_cli_options *options)
@@ -916,6 +1237,7 @@ static int handle_boot_timeout(int argc)
 
   if (!connected)
     {
+      blind_badge_state_set(BLIND_BADGE_STATE_OFFLINE, "WiFi timeout");
       blind_badge_display_show_boot_status(0);
       printf("[BlindBadge] boot_timeout: WiFi ERROR after %ds, "
              "fallback active\n",
@@ -1009,6 +1331,366 @@ static int handle_emergency(int argc,
     }
 
   return run_event(&event, options);
+}
+
+static volatile int g_button_service_running;
+static pthread_mutex_t g_button_voice_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_button_voice_running;
+
+static void *button_voice_worker(void *arg)
+{
+  struct blind_badge_cli_options options =
+    {
+      .ai_mode = BLIND_BADGE_AI_OFF,
+#ifdef CONFIG_VIDEO_FB
+      .use_lcd = 1,
+#else
+      .use_lcd = 0,
+#endif
+      .option_count = 0
+    };
+  char *voice_argv[] = { "blind_badge_app", "voice_asr", "3", NULL };
+
+  (void)arg;
+  handle_voice_asr(3, voice_argv, &options);
+
+  pthread_mutex_lock(&g_button_voice_lock);
+  g_button_voice_running = 0;
+  pthread_mutex_unlock(&g_button_voice_lock);
+  return NULL;
+}
+
+static int start_button_voice_worker(void)
+{
+  pthread_attr_t attr;
+  pthread_t thread;
+  int ret;
+
+  pthread_mutex_lock(&g_button_voice_lock);
+  if (g_button_voice_running)
+    {
+      pthread_mutex_unlock(&g_button_voice_lock);
+      printf("[BlindBadge] button.voice: recognition already running\n");
+      return -EBUSY;
+    }
+
+  g_button_voice_running = 1;
+  pthread_mutex_unlock(&g_button_voice_lock);
+
+  blind_badge_state_set(BLIND_BADGE_STATE_LISTENING,
+                        "short press, speak now");
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, BLIND_BADGE_BUTTON_VOICE_STACK_SIZE);
+  ret = pthread_create(&thread, &attr, button_voice_worker, NULL);
+  pthread_attr_destroy(&attr);
+  if (ret != 0)
+    {
+      pthread_mutex_lock(&g_button_voice_lock);
+      g_button_voice_running = 0;
+      pthread_mutex_unlock(&g_button_voice_lock);
+      printf("[BlindBadge] button.voice: worker start failed: %d\n", ret);
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
+                            "voice worker start failed");
+      return -ret;
+    }
+
+  pthread_detach(thread);
+  return 0;
+}
+
+static uint64_t monotonic_milliseconds(void)
+{
+  struct timespec now;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static void handle_button_short_press(void)
+{
+  printf("[BlindBadge] button: SHORT_PRESS\n");
+  if (start_button_voice_worker() != 0)
+    {
+      UART_LINK_SendFlag("VIBRATION_OFF");
+      return;
+    }
+
+  UART_LINK_SendFlag("VIBRATION_SHORT");
+}
+
+static void handle_button_double_press(void)
+{
+  printf("[BlindBadge] button: DOUBLE_PRESS\n");
+  blind_badge_state_set(BLIND_BADGE_STATE_RESULT, "repeat last reminder");
+  UART_LINK_SendFlag("VIBRATION_SHORT");
+  printf("[BlindBadge] button.action: repeat request acknowledged; "
+         "audio replay is not configured\n");
+}
+
+static void handle_button_long_press(void)
+{
+  struct blind_badge_cli_options options =
+    {
+      .ai_mode = BLIND_BADGE_AI_OFF,
+#ifdef CONFIG_VIDEO_FB
+      .use_lcd = 1,
+#else
+      .use_lcd = 0,
+#endif
+      .option_count = 0
+    };
+
+  printf("[BlindBadge] button: LONG_PRESS\n");
+  handle_emergency(2, &options);
+}
+
+static int handle_button_service(int argc)
+{
+#ifdef CONFIG_INPUT_BUTTONS
+  btn_buttonset_t buttons = 0;
+  bool pressed = false;
+  bool long_sent = false;
+  int pending_clicks = 0;
+  uint64_t press_started_ms = 0;
+  uint64_t click_deadline_ms = 0;
+  int fd;
+
+  if (argc != 2)
+    {
+      printf("[BlindBadge] error: button_service takes no arguments.\n");
+      return 1;
+    }
+
+  if (g_button_service_running)
+    {
+      printf("[BlindBadge] button_service: already running\n");
+      return 0;
+    }
+
+  fd = open(BLIND_BADGE_BUTTON_DEVICE, O_RDONLY);
+  if (fd < 0)
+    {
+      printf("[BlindBadge] button_service: open %s failed: errno=%d\n",
+             BLIND_BADGE_BUTTON_DEVICE, errno);
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
+                            "button device unavailable");
+      return 1;
+    }
+
+  g_button_service_running = 1;
+  printf("[BlindBadge] button_service: started device=%s short=<%dms "
+         "double=%dms long=%dms\n",
+         BLIND_BADGE_BUTTON_DEVICE, BLIND_BADGE_BUTTON_LONG_MS,
+         BLIND_BADGE_BUTTON_DOUBLE_MS, BLIND_BADGE_BUTTON_LONG_MS);
+
+  while (g_button_service_running)
+    {
+      uint64_t now_ms = monotonic_milliseconds();
+      bool current_pressed;
+      ssize_t nread = read(fd, &buttons, sizeof(buttons));
+
+      if (nread != sizeof(buttons))
+        {
+          printf("[BlindBadge] button_service: read failed: errno=%d\n",
+                 errno);
+          blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
+                                "button read failed");
+          break;
+        }
+
+      current_pressed = (buttons & 1u) != 0;
+      if (current_pressed && !pressed)
+        {
+          pressed = true;
+          long_sent = false;
+          press_started_ms = now_ms;
+        }
+      else if (current_pressed && pressed && !long_sent &&
+               now_ms - press_started_ms >= BLIND_BADGE_BUTTON_LONG_MS)
+        {
+          long_sent = true;
+          pending_clicks = 0;
+          handle_button_long_press();
+        }
+      else if (!current_pressed && pressed)
+        {
+          pressed = false;
+          if (!long_sent)
+            {
+              pending_clicks++;
+              if (pending_clicks >= 2)
+                {
+                  pending_clicks = 0;
+                  handle_button_double_press();
+                }
+              else
+                {
+                  click_deadline_ms = now_ms +
+                                      BLIND_BADGE_BUTTON_DOUBLE_MS;
+                }
+            }
+        }
+
+      if (!pressed && pending_clicks == 1 && now_ms >= click_deadline_ms)
+        {
+          pending_clicks = 0;
+          handle_button_short_press();
+        }
+
+      usleep(BLIND_BADGE_BUTTON_POLL_MS * 1000);
+    }
+
+  close(fd);
+  g_button_service_running = 0;
+  printf("[BlindBadge] button_service: stopped\n");
+  return 0;
+#else
+  (void)argc;
+  printf("[BlindBadge] button_service: CONFIG_INPUT_BUTTONS is disabled.\n");
+  return 1;
+#endif
+}
+
+static int handle_state_command(int argc, char *argv[])
+{
+  enum blind_badge_state state;
+
+  if (argc == 2)
+    {
+      return blind_badge_state_show() == 0 ? 0 : 1;
+    }
+
+  if (argc != 3 || blind_badge_state_parse(argv[2], &state) != 0)
+    {
+      printf("[BlindBadge] error: state needs one of IDLE, LISTENING, "
+             "RECORDING, CAPTURING, PROCESSING, RESULT, OFFLINE, ERROR, "
+             "EMERGENCY.\n");
+      return 1;
+    }
+
+  return blind_badge_state_set(state, "manual command") == 0 ? 0 : 1;
+}
+
+/****************************************************************************
+ * Fall detection
+ ****************************************************************************/
+
+static struct blind_badge_cli_options g_fall_ai_options =
+  {
+    .ai_mode = BLIND_BADGE_AI_OFF,
+#ifdef CONFIG_VIDEO_FB
+    .use_lcd = 1,
+#else
+    .use_lcd = 0,
+#endif
+    .option_count = 0
+  };
+
+static void fall_detect_callback(void *arg)
+{
+  struct blind_badge_event event =
+    {
+      .type = BLIND_BADGE_EVENT_EMERGENCY,
+      .direction = BLIND_BADGE_DIR_UNKNOWN,
+      .severity = BLIND_BADGE_SEVERITY_EMERGENCY,
+      .distance_cm = 0
+    };
+
+  (void)arg;
+  printf("[BlindBadge] fall_detect: fall confirmed, triggering emergency\n");
+  run_event(&event, &g_fall_ai_options);
+}
+
+static int handle_fall_start(int argc, char *argv[],
+                             struct blind_badge_cli_options *options)
+{
+  int ret;
+
+  ret = parse_options(argc, argv, options);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  g_fall_ai_options = *options;
+
+  ret = fall_detect_start("/dev/i2c0", NULL, fall_detect_callback, NULL);
+  if (ret < 0)
+    {
+      printf("[BlindBadge] error: fall_detect_start failed (%d)\n", ret);
+      return 1;
+    }
+
+  return 0;
+}
+
+static int handle_fall_stop(int argc)
+{
+  if (argc != 2)
+    {
+      printf("[BlindBadge] error: fall_stop takes no arguments.\n");
+      return 1;
+    }
+
+  return fall_detect_stop() == 0 ? 0 : 1;
+}
+
+static int handle_fall_status(int argc)
+{
+  struct fall_detect_state st;
+  static const char *phase_names[] =
+  {
+    "IDLE", "FREE_FALL", "IMPACT", "STILLNESS"
+  };
+
+  if (argc != 2)
+    {
+      printf("[BlindBadge] error: fall_status takes no arguments.\n");
+      return 1;
+    }
+
+  fall_detect_get_state(&st);
+  printf("[BlindBadge] fall_status: running=%d phase=%s "
+         "last_magnitude=%.2fg fall_count=%d cooldown=%dms\n",
+         st.running,
+         st.phase < 4 ? phase_names[st.phase] : "UNKNOWN",
+         (double)st.last_magnitude, st.fall_count,
+         st.cooldown_remaining_ms);
+  return 0;
+}
+
+static int handle_fall_read(int argc)
+{
+  struct qma7981_dev dev;
+  struct qma7981_sample sample;
+  int ret;
+
+  if (argc != 2)
+    {
+      printf("[BlindBadge] error: fall_read takes no arguments.\n");
+      return 1;
+    }
+
+  ret = qma7981_init(&dev, "/dev/i2c0");
+  if (ret < 0)
+    {
+      printf("[BlindBadge] error: QMA7981 init failed (%d)\n", ret);
+      return 1;
+    }
+
+  ret = qma7981_read_sample(&dev, &sample);
+  if (ret < 0)
+    {
+      printf("[BlindBadge] error: read failed (%d)\n", ret);
+      qma7981_close(&dev);
+      return 1;
+    }
+
+  printf("[BlindBadge] accel: x=%.3fg y=%.3fg z=%.3fg |a|=%.3fg\n",
+         (double)sample.x, (double)sample.y,
+         (double)sample.z, (double)sample.magnitude);
+  qma7981_close(&dev);
+  return 0;
 }
 
 static int demo_run_obstacle(int distance_cm,
@@ -1133,6 +1815,32 @@ int main(int argc, char *argv[])
       return handle_boot_timeout(argc);
     }
 
+  if (strcmp(argv[1], "state") == 0)
+    {
+      return handle_state_command(argc, argv);
+    }
+
+  if (strcmp(argv[1], "button_service") == 0)
+    {
+      return handle_button_service(argc);
+    }
+
+  if (strcmp(argv[1], "button_stop") == 0)
+    {
+      g_button_service_running = 0;
+      printf("[BlindBadge] button_service: stop requested\n");
+      return 0;
+    }
+
+  if (strcmp(argv[1], "button_status") == 0)
+    {
+      printf("[BlindBadge] button_service: %s\n",
+             g_button_service_running ? "RUNNING" : "STOPPED");
+      printf("[BlindBadge] state.current: %s\n",
+             blind_badge_state_name(blind_badge_state_get()));
+      return 0;
+    }
+
   if (strcmp(argv[1], "obstacle") == 0)
     {
       return handle_obstacle(argc, argv, &options);
@@ -1193,6 +1901,11 @@ int main(int argc, char *argv[])
       return handle_voice_ai_text(argc, argv, &options);
     }
 
+  if (strcmp(argv[1], "voice_asr") == 0)
+    {
+      return handle_voice_asr(argc, argv, &options);
+    }
+
   if (strcmp(argv[1], "voice_ai") == 0)
     {
       return handle_voice_ai(argc, argv, &options);
@@ -1200,6 +1913,7 @@ int main(int argc, char *argv[])
 
   if (strcmp(argv[1], "uart_link_start") == 0)
     {
+      UART_LINK_SetEventHandler(handle_uart_link_event, NULL);
       if (UART_LINK_Start() != 0)
         {
           return 1;
@@ -1220,6 +1934,23 @@ int main(int argc, char *argv[])
       return 0;
     }
 
+  if (strcmp(argv[1], "uart_link_send") == 0)
+    {
+      if (argc != 3)
+        {
+          printf("[BlindBadge] error: uart_link_send needs one flag.\n");
+          return 1;
+        }
+
+      if (UART_LINK_SendFlag(argv[2]) != 0)
+        {
+          printf("[BlindBadge] uart_link_send: failed or disconnected.\n");
+          return 1;
+        }
+      printf("[BlindBadge] uart_link_send: queued flag=%s\n", argv[2]);
+      return 0;
+    }
+
   if (strcmp(argv[1], "install_skill") == 0)
     {
       if (argc != 2)
@@ -1230,6 +1961,26 @@ int main(int argc, char *argv[])
         }
 
       return blind_badge_install_skill();
+    }
+
+  if (strcmp(argv[1], "fall_start") == 0)
+    {
+      return handle_fall_start(argc, argv, &options);
+    }
+
+  if (strcmp(argv[1], "fall_stop") == 0)
+    {
+      return handle_fall_stop(argc);
+    }
+
+  if (strcmp(argv[1], "fall_status") == 0)
+    {
+      return handle_fall_status(argc);
+    }
+
+  if (strcmp(argv[1], "fall_read") == 0)
+    {
+      return handle_fall_read(argc);
     }
 
   printf("[BlindBadge] error: unknown command: %s\n", argv[1]);

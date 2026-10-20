@@ -412,15 +412,37 @@ static const struct blind_badge_cjk_glyph g_cjk_glyphs[] =
   {0xff0c, {0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x1800, 0x1800, 0x0800, 0x0800, 0x3000}}, /* ， */
 };
 
+#include "blind_badge_cjk_font.h"
+
 static const struct blind_badge_cjk_glyph *find_cjk_glyph(uint32_t codepoint)
 {
   size_t i;
+  size_t low = 0;
+  size_t high = sizeof(g_cjk_full_glyphs) / sizeof(g_cjk_full_glyphs[0]);
 
   for (i = 0; i < sizeof(g_cjk_glyphs) / sizeof(g_cjk_glyphs[0]); i++)
     {
       if (g_cjk_glyphs[i].codepoint == codepoint)
         {
           return &g_cjk_glyphs[i];
+        }
+    }
+
+  while (low < high)
+    {
+      size_t mid = low + (high - low) / 2;
+      if (g_cjk_full_glyphs[mid].codepoint == codepoint)
+        {
+          return &g_cjk_full_glyphs[mid];
+        }
+
+      if (g_cjk_full_glyphs[mid].codepoint < codepoint)
+        {
+          low = mid + 1;
+        }
+      else
+        {
+          high = mid;
         }
     }
 
@@ -770,8 +792,6 @@ static int display_show_lines_with_wifi(const char *line0,
   draw_text(&fb, 8, 134, line3 != NULL ? line3 : "", 255, 255, 255);
 
   update_screen(&fb);
-  printf("[BlindBadge] lcd: updated %ux%u bpp=%u\n",
-         fb.vinfo.xres, fb.vinfo.yres, fb.pinfo.bpp);
   fb_close(&fb);
   return 0;
 #else
@@ -1013,7 +1033,7 @@ int blind_badge_display_show_ai_event(const struct blind_badge_event *event,
 
   next = copy_lcd_utf8_cells(line2, sizeof(line2), ai_response, 24);
   copy_lcd_utf8_cells(line3, sizeof(line3), next, 24);
-  printf("[BlindBadge] lcd_note: LCD shows AI/fallback text with limited built-in CJK glyphs.\n");
+  printf("[BlindBadge] lcd_note: LCD shows AI/fallback text with built-in CJK glyphs.\n");
 
   return blind_badge_display_show_lines("BlindBadge", line1, line2, line3);
 }

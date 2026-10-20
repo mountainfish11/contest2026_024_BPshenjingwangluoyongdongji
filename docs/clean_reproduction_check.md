@@ -82,7 +82,7 @@ PASS - no pre-existing data directory is required.
 
 ## Local Absolute Paths
 
-The source and docs do not require local workspace paths such as `/home/GGB/openvela` for runtime behavior. Build and QEMU commands are run from the openvela workspace root.
+The source and docs do not require local workspace paths such as `/home/mountainfish/openvela` for runtime behavior. Build and QEMU commands are run from the openvela workspace root.
 
 Status:
 
@@ -170,7 +170,7 @@ LCD displays the final MiMo reminder text
 
 ## Pre-Submission Commands
 
-Run from `/home/GGB/openvela`:
+Run from `/home/mountainfish/openvela`:
 
 ```bash
 ./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap --cmake -j2

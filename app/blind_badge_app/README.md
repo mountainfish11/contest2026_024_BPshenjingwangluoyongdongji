@@ -42,7 +42,32 @@ blind_badge_app emergency --ai --lcd
 blind_badge_app demo --ai --lcd
 ```
 
-已验证 `lcd_test` 能显示 `BlindBadge / LCD OK`，`lcd_test zh` 能显示 `前方障碍`。当前显示层内置了有限 16x16 中文点阵，覆盖 BlindBadge 常用安全短句；它能显示 AI/fallback 的中文提醒，但不是完整通用中文字库。
+`lcd_test` 显示 `BlindBadge / LCD OK`，`lcd_test zh` 显示 `前方障碍`。
+显示层内置 16x16 中文点阵，覆盖 U+4E00 至 U+9FFF 汉字、U+3000 至
+U+303F 中日韩标点以及 U+FF01 至 U+FF60 全角字符，支持普通语音识别结果。
+区间外的字符仍显示问号。字库由 `tools/generate_lcd_font.py` 使用 Pillow
+和文泉驿正黑生成，授权说明见 `app/blind_badge_app/FONT-LICENSE.txt`。
+
+## 主板状态机与 BOOT 按键
+
+主板状态统一为 `IDLE`、`LISTENING`、`RECORDING`、`CAPTURING`、
+`PROCESSING`、`RESULT`、`OFFLINE`、`ERROR` 和 `EMERGENCY`。状态变化会
+写入串口并刷新 LCD，可使用以下命令检查或手动切换：
+
+```text
+blind_badge_app state
+blind_badge_app state PROCESSING
+blind_badge_app button_status
+```
+
+启动脚本会在后台运行 `button_service`，通过标准 `/dev/buttons` 设备读取
+ESP32-S3-EYE 的 BOOT 键：
+
+- 短按：启动后台 3 秒录音和语音识别，依次进入 `LISTENING`、`RECORDING`、
+  `PROCESSING`、`RESULT`，将识别文字打印到串口并显示在 LCD；
+- 双击：显示“重复上次提醒”请求并向副板发送短震标志；
+- 长按 1.5 秒：触发本地 `EMERGENCY` 事件，下发强震和紧急发送标志；
+- 双击目前只确认重复请求，尚未配置扬声器，因此不会伪装成已经播放语音。
 
 ## AI 闭环
 
@@ -56,9 +81,11 @@ blind_badge_app demo --ai --lcd
 blind_badge_app uart_link_start
 ```
 
-模块接口统一为 `UART_LINK_Start()`、`UART_LINK_Stop()` 和
-`UART_LINK_IsConnected()`。主板服务默认监听 TCP `45679`，并在 UDP
-`45678` 响应副板发现请求。
+模块接口统一为 `UART_LINK_Start()`、`UART_LINK_Stop()`、
+`UART_LINK_IsConnected()` 和 `UART_LINK_SendFlag()`。主板服务默认监听
+TCP `45679`，并在 UDP `45678` 响应副板发现请求。主板其他任务调用
+`UART_LINK_SendFlag()` 时通过命名消息队列交给唯一的链路线程，不直接
+共享 TCP 描述符。
 
 协议帧格式：
 
@@ -66,13 +93,24 @@ blind_badge_app uart_link_start
 UART_LINK/1 <TYPE> <SEQ> <LEN> <PAYLOAD>\n
 ```
 
-当前基础类型为 `DISCOVER`、`HELLO`、`HELLO_ACK`、`PING`、`PONG`。`HELLO_ACK` 和 `PONG` 能证明主副板应用层已经互通；后续外设数据使用新的 `TYPE`，不修改 Wi-Fi 管理代码。
+基础类型为 `DISCOVER`、`HELLO`、`HELLO_ACK`、`PING`、`PONG`。事件类型为
+`OBSTACLE`、`STEP_DOWN`、`EMERGENCY`，主板用 `EVENT_ACK` 确认接收。
+主板使用 `COMMAND` 下发控制标志，子板用 `COMMAND_ACK` 确认。收到事件后
+会直接进入本地策略、LCD 和动作路径，不依赖 MiMo。
+
+主板手动下发测试标志：
+
+```text
+blind_badge_app uart_link_send TEST_FLAG
+```
 
 ## ESP32-S3-EYE 麦克风录音
 
-主板板载数字麦克风通过 I2S0 接入，当前配置为单声道、16 kHz、16-bit
-raw PCM，设备节点是 `/dev/audio/pcm_in0`。一次性录音命令会在指定时间后
-自动停止，并打印非零样本数、最小值、最大值和峰值：
+主板板载数字麦克风通过 I2S0 接入，设备节点是 `/dev/audio/pcm_in0`。
+硬件以单声道、16 kHz、32-bit I2S 采集，应用先丢弃 100 ms 启动瞬态，
+再取每个采样的高 16 位，保存为小端 signed 16-bit raw PCM 并交给 ASR。
+一次录音实际采集时长比指定时长多 100 ms，最终 PCM 保留指定时长。
+命令自动停止，并打印非零样本数、最小值、最大值和峰值：
 
 ```text
 blind_badge_app mic_record
@@ -88,7 +126,18 @@ blind_badge_app mic_dump /tmp/mic.pcm 4096
 会消失。`mic_dump` 会在 `mic_dump_begin` 和 `mic_dump_end` 标记之间按 hex
 打印 PCM 字节，主机脚本可以据此还原成 `.pcm` / `.wav` 做离线 ASR。
 
-## 语音到 AI/LCD 闭环
+## 按键语音识别与 AI/LCD 闭环
+
+短按 BOOT 键后直接说话，主板会录制 3 秒并只执行 ASR，不调用 MiMo。也可用
+命令单独验证同一条语音识别路径：
+
+```text
+blind_badge_app voice_asr
+blind_badge_app voice_asr 3
+```
+
+成功时串口打印 `[BlindBadge] asr_text: ...`，LCD 显示 `VOICE / RECOGNIZED`
+和识别文字。录音识别在独立线程运行，按键服务仍可检测长按紧急操作。
 
 主板固件已经接入 ai_agent 的 voice ASR 抽象。`voice_ai` 会打开麦克风录音，
 把 16 kHz / mono / signed 16-bit PCM 交给当前 ASR 后端识别，再把识别文字
@@ -109,6 +158,18 @@ blind_badge_app voice_ai 3 --ai
 ai_agent set_volc_asr <app_id> <token> <cluster>
 ai_agent set_voice_asr volcengine
 ```
+
+豆包流式语音识别 2.0 小时版需要将第三个参数设为资源 ID：
+
+```text
+ai_agent set_volc_asr <app_id> <token> volc.seedasr.sauc.duration
+ai_agent set_voice_asr volcengine
+```
+
+固件根据第三个参数选择协议：`volc.seedasr.sauc.*` 或
+`volc.bigasr.sauc.*` 使用 V3 接口及资源鉴权，旧版 cluster 使用 V2。
+`voice_asr` 的录音文件使用 `bigmodel_nostream` 接口，流式会话使用
+`bigmodel_async` 接口。当前板端配置存放在 RAM 文件系统，重启后需重新配置。
 
 如果 ASR 暂时不可用，也可以继续用 `voice_ai_text` 验证
 “识别文字 -> ai_agent -> LCD”的后半段链路，直接把外部 ASR 识别后的文字作为
