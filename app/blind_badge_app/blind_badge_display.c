@@ -954,6 +954,18 @@ void ai_agent_display_ask_result(const char *response, int success)
                                  line2, line3);
 }
 
+int blind_badge_display_show_asr_result(const char *text)
+{
+  char line2[BLIND_BADGE_LINE_SIZE];
+  char line3[BLIND_BADGE_LINE_SIZE];
+  const char *next;
+
+  next = copy_lcd_utf8_cells(line2, sizeof(line2),
+                             text != NULL ? text : "", 24);
+  copy_lcd_utf8_cells(line3, sizeof(line3), next, 24);
+  return blind_badge_display_show_lines("VOICE", "ASR TEXT", line2, line3);
+}
+
 int blind_badge_display_show_event(const struct blind_badge_event *event,
                                    const char *message)
 {

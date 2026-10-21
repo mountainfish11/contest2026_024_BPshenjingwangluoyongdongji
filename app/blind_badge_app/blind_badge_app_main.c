@@ -86,6 +86,7 @@ static void print_help(void)
   printf("  blind_badge_app mic_stats <16bit_pcm_file>\n");
   printf("  blind_badge_app mic_dump <16bit_pcm_file> [max_bytes]\n");
   printf("  blind_badge_app voice_asr [seconds] [--lcd]\n");
+  printf("  blind_badge_app voice_pcm [seconds] [--lcd]\n");
   printf("  blind_badge_app voice_ai [seconds] [--ai|--agent] [--lcd]\n");
   printf("  blind_badge_app voice_ai_text <recognized_text...> [--ai|--agent]\n");
   printf("  blind_badge_app install_skill\n");
@@ -93,6 +94,7 @@ static void print_help(void)
   printf("  blind_badge_app fall_stop\n");
   printf("  blind_badge_app fall_status\n");
   printf("  blind_badge_app fall_read\n");
+  printf("  blind_badge_app voice_pcm_test\n");
   printf("  blind_badge_app uart_link_start|uart_link_stop|uart_link_status\n");
   printf("  blind_badge_app uart_link_send <UPPERCASE_FLAG>\n");
   printf("  --ai: call ai_agent LLM router directly and print ai_response\n");
@@ -685,7 +687,6 @@ static int parse_voice_seconds(const char *command, int argc, char *argv[],
   return OK;
 }
 
-#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 static int load_16bit_pcm(const char *path, long seconds,
                           unsigned char **pcm_out,
                           size_t *pcm_len_out)
@@ -752,6 +753,7 @@ static int load_16bit_pcm(const char *path, long seconds,
   return OK;
 }
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 static int run_voice_asr_from_pcm_file(long seconds,
                                        const struct blind_badge_cli_options *options,
                                        char *asr_text, size_t asr_text_size)
@@ -884,6 +886,90 @@ static int run_voice_asr_from_pcm_file(long seconds,
   return 0;
 }
 #endif
+
+static int handle_voice_pcm(int argc, char *argv[],
+                            const struct blind_badge_cli_options *options)
+{
+  unsigned char *pcm = NULL;
+  size_t pcm_len = 0;
+  long seconds;
+  int ret;
+
+  if (parse_voice_seconds("voice_pcm", argc, argv, &seconds) < 0)
+    {
+      return 1;
+    }
+
+  if (!UART_LINK_IsConnected())
+    {
+      printf("[BlindBadge] voice_pcm: sub-board is not connected.\n");
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
+                            "sub-board disconnected");
+      return 1;
+    }
+
+  printf("[BlindBadge] voice_pcm: speak for %ld second(s).\n", seconds);
+  blind_badge_state_set(BLIND_BADGE_STATE_RECORDING, "microphone active");
+  if (options->use_lcd)
+    {
+      blind_badge_display_show_lines("VOICE", "RECORDING",
+                                     "Please speak now", "");
+    }
+
+  ret = record_mic_16bit_file(BLIND_BADGE_VOICE_AI_PCM_FILE, seconds);
+  if (ret != 0)
+    {
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "recording failed");
+      if (options->use_lcd)
+        {
+          blind_badge_display_show_lines("VOICE", "REC ERROR",
+                                         "mic failed", "");
+        }
+      return 1;
+    }
+
+  ret = load_16bit_pcm(BLIND_BADGE_VOICE_AI_PCM_FILE, seconds,
+                       &pcm, &pcm_len);
+  if (ret < 0)
+    {
+      printf("[BlindBadge] voice_pcm: PCM load failed (%d).\n", ret);
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "PCM load failed");
+      return 1;
+    }
+
+  blind_badge_state_set(BLIND_BADGE_STATE_PROCESSING,
+                        "sending PCM to sub-board");
+  if (options->use_lcd)
+    {
+      blind_badge_display_show_lines("VOICE", "SENDING",
+                                     "PCM to sub-board", "");
+    }
+
+  ret = UART_LINK_SendPCM(pcm, pcm_len);
+  free(pcm);
+  if (ret != (int)pcm_len)
+    {
+      printf("[BlindBadge] voice_pcm: transfer failed (ret=%d).\n", ret);
+      blind_badge_state_set(BLIND_BADGE_STATE_ERROR, "PCM transfer failed");
+      if (options->use_lcd)
+        {
+          blind_badge_display_show_lines("VOICE", "SEND ERROR",
+                                         "sub-board failed", "");
+        }
+      return 1;
+    }
+
+  printf("[BlindBadge] voice_pcm: transfer complete, %zu bytes verified.\n",
+         pcm_len);
+  blind_badge_state_set(BLIND_BADGE_STATE_PROCESSING,
+                        "waiting for sub-board ASR");
+  if (options->use_lcd)
+    {
+      blind_badge_display_show_lines("VOICE", "RECOGNIZING",
+                                     "PCM uploaded", "");
+    }
+  return 0;
+}
 
 static int handle_voice_asr(int argc, char *argv[],
                             const struct blind_badge_cli_options *options)
@@ -1152,6 +1238,14 @@ static void handle_uart_link_event(const struct uart_link_event *link_event,
         event.severity = BLIND_BADGE_SEVERITY_EMERGENCY;
         break;
 
+      case UART_LINK_EVENT_ASR_RESULT:
+        printf("[BlindBadge] ASR result from sub-board: %s\n",
+               link_event->text);
+        blind_badge_state_set(BLIND_BADGE_STATE_RESULT,
+                              "speech recognized");
+        blind_badge_display_show_asr_result(link_event->text);
+        return;
+
       default:
         return;
     }
@@ -1349,10 +1443,10 @@ static void *button_voice_worker(void *arg)
 #endif
       .option_count = 0
     };
-  char *voice_argv[] = { "blind_badge_app", "voice_asr", "3", NULL };
+  char *voice_argv[] = { "blind_badge_app", "voice_pcm", "3", NULL };
 
   (void)arg;
-  handle_voice_asr(3, voice_argv, &options);
+  handle_voice_pcm(3, voice_argv, &options);
 
   pthread_mutex_lock(&g_button_voice_lock);
   g_button_voice_running = 0;
@@ -1906,6 +2000,11 @@ int main(int argc, char *argv[])
       return handle_voice_asr(argc, argv, &options);
     }
 
+  if (strcmp(argv[1], "voice_pcm") == 0)
+    {
+      return handle_voice_pcm(argc, argv, &options);
+    }
+
   if (strcmp(argv[1], "voice_ai") == 0)
     {
       return handle_voice_ai(argc, argv, &options);
@@ -1981,6 +2080,35 @@ int main(int argc, char *argv[])
   if (strcmp(argv[1], "fall_read") == 0)
     {
       return handle_fall_read(argc);
+    }
+
+  if (strcmp(argv[1], "voice_pcm_test") == 0)
+    {
+      uint8_t test_pcm[1600];
+      int16_t sample;
+      int i;
+      int ret;
+
+      for (i = 0; i < 800; i++)
+        {
+          sample = (int16_t)((i % 200) * 100 - 10000);
+          test_pcm[i * 2] = sample & 0xff;
+          test_pcm[i * 2 + 1] = (sample >> 8) & 0xff;
+        }
+
+      printf("[BlindBadge] voice_pcm_test: sending %u bytes test PCM...\n",
+             (unsigned)sizeof(test_pcm));
+      ret = UART_LINK_SendPCM(test_pcm, sizeof(test_pcm));
+      if (ret > 0)
+        {
+          printf("[BlindBadge] voice_pcm_test: sent %d bytes OK\n", ret);
+          return 0;
+        }
+      else
+        {
+          printf("[BlindBadge] voice_pcm_test: send failed (ret=%d)\n", ret);
+          return 1;
+        }
     }
 
   printf("[BlindBadge] error: unknown command: %s\n", argv[1]);
