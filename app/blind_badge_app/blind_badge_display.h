@@ -21,6 +21,5 @@ int blind_badge_display_show_ai_event(const struct blind_badge_event *event,
                                       int used_fallback);
 int blind_badge_display_show_ai_wait(const struct blind_badge_event *event);
 void ai_agent_display_ask_result(const char *response, int success);
-int blind_badge_display_show_asr_result(const char *text);
 
 #endif /* BLIND_BADGE_DISPLAY_H */
