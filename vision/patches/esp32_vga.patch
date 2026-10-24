@@ -1,0 +1,20 @@
+diff --git a/camera_stream_download/camera_stream_download.ino b/camera_stream_download/camera_stream_download.ino
+index 65b9888..7c8f324 100644
+--- a/camera_stream_download/camera_stream_download.ino
++++ b/camera_stream_download/camera_stream_download.ino
+@@ -107,11 +107,11 @@ bool initCamera() {
+   c.pin_xclk = XCLK; c.pin_pclk = PCLK; c.pin_vsync = VSYNC;
+   c.pin_href = HREF; c.pin_sccb_sda = SIOD; c.pin_sccb_scl = SIOC;
+   c.pin_pwdn = PWDN; c.pin_reset = RESET;
+-  c.xclk_freq_hz = 10000000;
++  c.xclk_freq_hz = 20000000;
+   c.pixel_format = PIXFORMAT_JPEG;
+-  c.frame_size   = FRAMESIZE_QVGA;
+-  c.jpeg_quality = 12;
+-  c.fb_count     = 1;
++  c.frame_size   = FRAMESIZE_VGA;
++  c.jpeg_quality = 10;
++  c.fb_count     = 2;
+   c.grab_mode    = CAMERA_GRAB_LATEST;
+ 
+   if (ESP.getPsramSize() > 0) {

@@ -10,6 +10,8 @@
 #include "blind_badge_policy.h"
 #include "blind_badge_skill.h"
 #include "blind_badge_state.h"
+#include "blind_badge_vision.h"
+#include "blind_badge_vision_server.h"
 #include "qma7981.h"
 #include "uart_link.h"
 
@@ -60,6 +62,8 @@
 #define BLIND_BADGE_BUTTON_DOUBLE_MS 350
 #define BLIND_BADGE_BUTTON_LONG_MS 1500
 #define BLIND_BADGE_BUTTON_VOICE_STACK_SIZE 16384
+#define BLIND_BADGE_VISION_DEFAULT_PORT 45681
+#define BLIND_BADGE_VISION_HTTP_DEFAULT_PORT 80
 
 struct blind_badge_cli_options
 {
@@ -93,6 +97,12 @@ static void print_help(void)
   printf("  blind_badge_app fall_stop\n");
   printf("  blind_badge_app fall_status\n");
   printf("  blind_badge_app fall_read\n");
+  printf("  blind_badge_app vision_start <server_ipv4> [port]\n");
+  printf("  blind_badge_app vision_once <server_ipv4> [port]\n");
+  printf("  blind_badge_app vision_stop|vision_status\n");
+  printf("  blind_badge_app vision_server [port]\n");
+  printf("  blind_badge_app vision_server_stop|vision_server_status\n");
+  printf("  blind_badge_app vision_camera_test\n");
   printf("  blind_badge_app uart_link_start|uart_link_stop|uart_link_status\n");
   printf("  blind_badge_app uart_link_send <UPPERCASE_FLAG>\n");
   printf("  --ai: call ai_agent LLM router directly and print ai_response\n");
@@ -1997,6 +2007,101 @@ int main(int argc, char *argv[])
   if (strcmp(argv[1], "fall_read") == 0)
     {
       return handle_fall_read(argc);
+    }
+
+  if (strcmp(argv[1], "vision_start") == 0 ||
+      strcmp(argv[1], "vision_once") == 0)
+    {
+      long port = BLIND_BADGE_VISION_DEFAULT_PORT;
+      char *end;
+      int ret;
+
+      if (argc < 3 || argc > 4)
+        {
+          printf("[BlindBadge] error: %s <server_ipv4> [port]\n",
+                 argv[1]);
+          return 1;
+        }
+
+      if (argc == 4)
+        {
+          errno = 0;
+          port = strtol(argv[3], &end, 10);
+          if (errno != 0 || end == argv[3] || *end != '\0' ||
+              port <= 0 || port > 65535)
+            {
+              printf("[BlindBadge] error: invalid vision port.\n");
+              return 1;
+            }
+        }
+
+      if (strcmp(argv[1], "vision_start") == 0)
+        {
+          ret = blind_badge_vision_start(argv[2], (int)port);
+        }
+      else
+        {
+          ret = blind_badge_vision_once(argv[2], (int)port);
+        }
+
+      if (ret < 0)
+        {
+          printf("[BlindBadge] %s failed (%d).\n", argv[1], ret);
+          return 1;
+        }
+
+      return 0;
+    }
+
+  if (strcmp(argv[1], "vision_stop") == 0)
+    {
+      return blind_badge_vision_stop() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_status") == 0)
+    {
+      return blind_badge_vision_status() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_server") == 0)
+    {
+      long port = BLIND_BADGE_VISION_HTTP_DEFAULT_PORT;
+      char *end;
+
+      if (argc > 3)
+        {
+          printf("[BlindBadge] error: vision_server [port]\n");
+          return 1;
+        }
+
+      if (argc == 3)
+        {
+          errno = 0;
+          port = strtol(argv[2], &end, 10);
+          if (errno != 0 || end == argv[2] || *end != '\0' ||
+              port <= 0 || port > 65535)
+            {
+              printf("[BlindBadge] error: invalid HTTP port.\n");
+              return 1;
+            }
+        }
+
+      return blind_badge_vision_server_run((int)port) == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_server_stop") == 0)
+    {
+      return blind_badge_vision_server_stop() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_server_status") == 0)
+    {
+      return blind_badge_vision_server_status() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_camera_test") == 0)
+    {
+      return blind_badge_vision_camera_test() == 0 ? 0 : 1;
     }
 
   printf("[BlindBadge] error: unknown command: %s\n", argv[1]);

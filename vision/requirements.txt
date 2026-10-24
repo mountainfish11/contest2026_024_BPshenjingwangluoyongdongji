@@ -1,0 +1,9 @@
+# Vision pipeline dependencies.
+# The CPU build is sufficient for VGA input. A CUDA-enabled PyTorch build can
+# improve throughput on systems with a supported NVIDIA GPU.
+ultralytics>=8.4
+torch>=2.6
+torchvision
+opencv-python>=4.8
+numpy>=1.24
+scipy>=1.10
