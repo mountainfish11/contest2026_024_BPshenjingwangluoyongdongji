@@ -52,7 +52,6 @@
 #define VISION_HTTP_IO_TIMEOUT_MS 5000
 #define VISION_HTTP_SEND_CHUNK 1024
 #define VISION_HTTP_SEND_DELAY_US 2000
-#define VISION_STREAM_SECONDS 20
 #define VISION_FRAME_TIMEOUT_MS 5000
 #define VISION_FRAME_RETRY_US 10000
 #define VISION_DEVICE "/dev/video0"
@@ -491,8 +490,6 @@ static int vision_handle_stream(int fd)
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
   struct vision_camera_s camera;
   struct v4l2_buffer buffer;
-  struct timespec started;
-  struct timespec now;
   char part[128];
   int length;
   int ret;
@@ -506,7 +503,6 @@ static int vision_handle_stream(int fd)
     }
 
   ret = vision_send_all(fd, stream_header, sizeof(stream_header) - 1);
-  clock_gettime(CLOCK_MONOTONIC, &started);
   while (ret == OK && !g_server_stop)
     {
       ret = vision_camera_capture(&camera, &buffer);
@@ -532,11 +528,6 @@ static int vision_handle_stream(int fd)
         }
 
       vision_camera_release(&camera, &buffer);
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      if (now.tv_sec - started.tv_sec >= VISION_STREAM_SECONDS)
-        {
-          break;
-        }
     }
 
   vision_camera_close(&camera);
