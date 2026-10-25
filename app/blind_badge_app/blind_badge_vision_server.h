@@ -9,5 +9,6 @@ int blind_badge_vision_server_run(int port);
 int blind_badge_vision_server_stop(void);
 int blind_badge_vision_server_status(void);
 int blind_badge_vision_camera_test(void);
+int blind_badge_vision_camera_bench(unsigned int frames);
 
 #endif /* BLIND_BADGE_VISION_SERVER_H */

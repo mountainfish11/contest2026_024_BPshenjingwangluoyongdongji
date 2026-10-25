@@ -229,17 +229,20 @@ def _judge_stream(s: ProbeResult, host: str, port: int, path: str) -> bool:
             if fps < 12:
                 print()
                 print(f"  ⚠️ 但帧率只有 {fps:.1f} fps —— 这是**板子/网络侧**的问题，不是识别慢:")
-                print("     · WiFi 信号弱：把电脑靠近板子；AP 模式下板子天线就在板子上")
-                print("     · 2.4GHz 拥挤：换信道，或把板子的 AP 信道固定（1/6/11）")
-                print("     · 单帧太大：固件里把 jpeg_quality 从 10 调到 12")
+                print("     · 直接对比板内相机基准与 /stream 帧率，区分采集与 TCP 瓶颈")
+                print("     · 检查 OpenVela V4L2 采集、JPEG 输出、缓冲重入队和 Wi-Fi 发送耗时")
+                print("     · 若需改帧率/分辨率/压缩，应修改当前 OpenVela 驱动及板级配置")
                 print("     · 板子同时被别的设备访问（手机开着这个页面也算）")
             else:
                 print(f"     帧率 {fps:.1f} fps —— 采集端没问题，慢的是识别端")
         _report_frame_size(s.body)
         print()
-        print("  下一步：")
-        print(f"    python -m tools.calibrate --source "
-              f"mjpeg:http://{host}:{port}{path} --height 1.2 --pitch 30")
+        if s.frames / s.elapsed < 12:
+            print("  下一步：先完成板端帧率与稳定性优化；几何标定不会提高帧率。")
+        else:
+            print("  下一步：")
+            print(f"    python -m tools.calibrate --source "
+                  f"mjpeg:http://{host}:{port}{path} --height 1.2 --pitch 30")
         return True
 
     # ---------- 情况 2：TCP 通，但连 HTTP 头都没收到

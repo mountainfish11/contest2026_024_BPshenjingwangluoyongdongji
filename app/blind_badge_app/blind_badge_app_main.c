@@ -103,6 +103,7 @@ static void print_help(void)
   printf("  blind_badge_app vision_server [port]\n");
   printf("  blind_badge_app vision_server_stop|vision_server_status\n");
   printf("  blind_badge_app vision_camera_test\n");
+  printf("  blind_badge_app vision_camera_bench [frames]\n");
   printf("  blind_badge_app uart_link_start|uart_link_stop|uart_link_status\n");
   printf("  blind_badge_app uart_link_send <UPPERCASE_FLAG>\n");
   printf("  --ai: call ai_agent LLM router directly and print ai_response\n");
@@ -2102,6 +2103,33 @@ int main(int argc, char *argv[])
   if (strcmp(argv[1], "vision_camera_test") == 0)
     {
       return blind_badge_vision_camera_test() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "vision_camera_bench") == 0)
+    {
+      long frames = 30;
+      char *end;
+
+      if (argc > 3)
+        {
+          printf("[BlindBadge] error: vision_camera_bench [frames]\n");
+          return 1;
+        }
+
+      if (argc == 3)
+        {
+          errno = 0;
+          frames = strtol(argv[2], &end, 10);
+          if (errno != 0 || end == argv[2] || *end != '\0' ||
+              frames < 1 || frames > 300)
+            {
+              printf("[BlindBadge] error: frames must be 1..300.\n");
+              return 1;
+            }
+        }
+
+      return blind_badge_vision_camera_bench((unsigned int)frames) == 0 ?
+             0 : 1;
     }
 
   printf("[BlindBadge] error: unknown command: %s\n", argv[1]);
