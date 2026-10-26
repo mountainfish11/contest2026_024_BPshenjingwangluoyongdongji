@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -49,18 +50,18 @@
 #define VISION_HTTP_DEFAULT_PORT 80
 #define VISION_HTTP_BACKLOG 2
 #define VISION_HTTP_REQUEST_MAX 512
-#define VISION_HTTP_IO_TIMEOUT_MS 5000
-#define VISION_HTTP_SEND_CHUNK 1024
-#define VISION_HTTP_SEND_DELAY_US 2000
-#define VISION_FRAME_TIMEOUT_MS 5000
+#define VISION_HTTP_IO_TIMEOUT_MS 1500
+#define VISION_HTTP_SEND_CHUNK 1400
+#define VISION_HTTP_SEND_DELAY_US 1000
+#define VISION_FRAME_TIMEOUT_MS 1500
 #define VISION_FRAME_RETRY_US 10000
 #define VISION_NET_BENCH_BLOCK_SIZE 12288
 #define VISION_NET_BENCH_BLOCKS 10
 #define VISION_DEVICE "/dev/video0"
 #define VISION_WIDTH 640
 #define VISION_HEIGHT 480
-#define VISION_JPEG_MAX (VISION_WIDTH * VISION_HEIGHT)
-#define VISION_CAMERA_BUFFERS 1
+#define VISION_JPEG_MAX (128 * 1024)
+#define VISION_CAMERA_BUFFERS 2
 
 /****************************************************************************
  * Private Types
@@ -72,6 +73,7 @@ struct vision_camera_s
   uint8_t *frames[VISION_CAMERA_BUFFERS];
   unsigned int buffer_count;
   enum v4l2_buf_type type;
+  bool streaming;
 };
 
 /****************************************************************************
@@ -96,6 +98,14 @@ static bool g_ap_running;
 
 static uint64_t vision_monotonic_us(void);
 
+static void vision_log_heap(const char *stage)
+{
+  struct mallinfo info = mallinfo();
+
+  printf("[BlindBadge] heap: %s free=%u largest=%u used=%u\n",
+         stage, info.fordblks, info.mxordblk, info.uordblks);
+}
+
 static int vision_send_all(int fd, const void *data, size_t length)
 {
   const uint8_t *cursor = data;
@@ -111,6 +121,8 @@ static int vision_send_all(int fd, const void *data, size_t length)
       ssize_t ret = send(fd, cursor + sent, chunk, 0);
       if (ret == 0)
         {
+          printf("[BlindBadge] send: peer closed sent=%u total=%u\n",
+                 (unsigned)sent, (unsigned)length);
           return -EPIPE;
         }
 
@@ -132,9 +144,14 @@ static int vision_send_all(int fd, const void *data, size_t length)
                   continue;
                 }
 
+              printf("[BlindBadge] send: poll failed sent=%u total=%u "
+                     "waitret=%d errno=%d\n",
+                     (unsigned)sent, (unsigned)length, waitret, errno);
               return waitret == 0 ? -ETIMEDOUT : -errno;
             }
 
+          printf("[BlindBadge] send: failed sent=%u total=%u errno=%d\n",
+                 (unsigned)sent, (unsigned)length, errno);
           return -errno;
         }
 
@@ -312,7 +329,7 @@ static int vision_camera_open(struct vision_camera_s *camera)
   request.type = camera->type;
   request.memory = V4L2_MEMORY_USERPTR;
   request.count = VISION_CAMERA_BUFFERS;
-  request.mode = V4L2_BUF_MODE_FIFO;
+  request.mode = V4L2_BUF_MODE_RING;
   ret = ioctl(camera->fd, VIDIOC_REQBUFS, (uintptr_t)&request);
   if (ret < 0)
     {
@@ -360,16 +377,6 @@ static int vision_camera_open(struct vision_camera_s *camera)
   printf("[BlindBadge] camera: QBUF OK count=%u bytes_each=%u\n",
          camera->buffer_count, (unsigned)VISION_JPEG_MAX);
 
-  ret = ioctl(camera->fd, VIDIOC_STREAMON, (uintptr_t)&camera->type);
-  if (ret < 0)
-    {
-      ret = -errno;
-      printf("[BlindBadge] camera: STREAMON failed (%d)\n", ret);
-      goto error;
-    }
-
-  printf("[BlindBadge] camera: STREAMON OK\n");
-
   return OK;
 
 error:
@@ -397,19 +404,22 @@ static void vision_camera_close(struct vision_camera_s *camera)
   int streamoff_ret = OK;
 
   close_started = vision_monotonic_us();
-  if (camera->fd >= 0)
+  if (camera->fd >= 0 && camera->streaming)
     {
       streamoff_ret = ioctl(camera->fd, VIDIOC_STREAMOFF,
                             (uintptr_t)&camera->type);
       streamoff_done = vision_monotonic_us();
+      printf("[BlindBadge] camera: close streamoff_ret=%d "
+             "streamoff_ms=%lu\n",
+             streamoff_ret,
+             (unsigned long)((streamoff_done - close_started) / 1000));
+      camera->streaming = false;
+    }
+
+  if (camera->fd >= 0)
+    {
       close(camera->fd);
       camera->fd = -1;
-      printf("[BlindBadge] camera: close streamoff_ret=%d "
-             "streamoff_ms=%lu close_ms=%lu\n",
-             streamoff_ret,
-             (unsigned long)((streamoff_done - close_started) / 1000),
-             (unsigned long)((vision_monotonic_us() - streamoff_done) /
-                             1000));
     }
 
   for (i = 0; i < VISION_CAMERA_BUFFERS; i++)
@@ -419,6 +429,77 @@ static void vision_camera_close(struct vision_camera_s *camera)
     }
 
   camera->buffer_count = 0;
+}
+
+static int vision_camera_start(struct vision_camera_s *camera)
+{
+  struct v4l2_buffer buffer;
+  int ret;
+
+  if (camera->streaming)
+    {
+      return OK;
+    }
+
+  /* Drain completed frames left by the preceding request.  Requeueing them
+   * before STREAMON gives V4L2 a clean set of writable containers while the
+   * sensor and allocated buffers remain persistent.
+   */
+
+  for (;;)
+    {
+      memset(&buffer, 0, sizeof(buffer));
+      buffer.type = camera->type;
+      buffer.memory = V4L2_MEMORY_USERPTR;
+      ret = ioctl(camera->fd, VIDIOC_DQBUF, (uintptr_t)&buffer);
+      if (ret < 0)
+        {
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+              break;
+            }
+
+          return -errno;
+        }
+
+      ret = ioctl(camera->fd, VIDIOC_QBUF, (uintptr_t)&buffer);
+      if (ret < 0)
+        {
+          return -errno;
+        }
+    }
+
+  ret = ioctl(camera->fd, VIDIOC_STREAMON, (uintptr_t)&camera->type);
+  if (ret < 0)
+    {
+      printf("[BlindBadge] camera: STREAMON failed errno=%d\n", errno);
+      return -errno;
+    }
+
+  camera->streaming = true;
+  printf("[BlindBadge] camera: STREAMON OK\n");
+  return OK;
+}
+
+static int vision_camera_stop(struct vision_camera_s *camera)
+{
+  int ret;
+
+  if (!camera->streaming)
+    {
+      return OK;
+    }
+
+  ret = ioctl(camera->fd, VIDIOC_STREAMOFF, (uintptr_t)&camera->type);
+  if (ret < 0)
+    {
+      printf("[BlindBadge] camera: STREAMOFF failed errno=%d\n", errno);
+      return -errno;
+    }
+
+  camera->streaming = false;
+  printf("[BlindBadge] camera: STREAMOFF OK\n");
+  return OK;
 }
 
 static uint8_t *vision_camera_frame(struct vision_camera_s *camera,
@@ -446,7 +527,9 @@ static int vision_camera_capture(struct vision_camera_s *camera,
                                  bool log_frame)
 {
   uint8_t *frame;
-  unsigned int elapsed_us = 0;
+  uint64_t deadline_us;
+  unsigned int discarded = 0;
+  int ret;
 
   if (log_frame)
     {
@@ -454,46 +537,56 @@ static int vision_camera_capture(struct vision_camera_s *camera,
              VISION_FRAME_TIMEOUT_MS);
     }
 
-  memset(buffer, 0, sizeof(*buffer));
-  buffer->type = camera->type;
-  buffer->memory = V4L2_MEMORY_USERPTR;
-
-  while (ioctl(camera->fd, VIDIOC_DQBUF, (uintptr_t)buffer) < 0)
+  deadline_us = vision_monotonic_us() + VISION_FRAME_TIMEOUT_MS * 1000;
+  while (vision_monotonic_us() < deadline_us)
     {
-      if (errno != EAGAIN && errno != EWOULDBLOCK)
+      memset(buffer, 0, sizeof(*buffer));
+      buffer->type = camera->type;
+      buffer->memory = V4L2_MEMORY_USERPTR;
+
+      ret = ioctl(camera->fd, VIDIOC_DQBUF, (uintptr_t)buffer);
+      if (ret < 0)
         {
-          printf("[BlindBadge] camera: DQBUF failed errno=%d\n", errno);
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+              printf("[BlindBadge] camera: DQBUF failed errno=%d\n",
+                     errno);
+              return -errno;
+            }
+
+          usleep(VISION_FRAME_RETRY_US);
+          continue;
+        }
+
+      frame = vision_camera_frame(camera, buffer);
+      if (frame != NULL && buffer->bytesused >= 4 &&
+          buffer->bytesused <= VISION_JPEG_MAX &&
+          frame[0] == 0xff && frame[1] == 0xd8 &&
+          frame[buffer->bytesused - 2] == 0xff &&
+          frame[buffer->bytesused - 1] == 0xd9)
+        {
+          if (log_frame)
+            {
+              printf("[BlindBadge] camera: frame ready bytes=%u "
+                     "discarded=%u\n",
+                     (unsigned)buffer->bytesused, discarded);
+            }
+
+          return OK;
+        }
+
+      discarded++;
+      ret = ioctl(camera->fd, VIDIOC_QBUF, (uintptr_t)buffer);
+      if (ret < 0)
+        {
+          printf("[BlindBadge] camera: invalid frame QBUF failed "
+                 "errno=%d\n", errno);
           return -errno;
         }
-
-      if (elapsed_us >= VISION_FRAME_TIMEOUT_MS * 1000)
-        {
-          printf("[BlindBadge] camera: frame timeout\n");
-          return -ETIMEDOUT;
-        }
-
-      usleep(VISION_FRAME_RETRY_US);
-      elapsed_us += VISION_FRAME_RETRY_US;
     }
 
-  if (log_frame)
-    {
-      printf("[BlindBadge] camera: frame ready bytes=%u\n",
-             (unsigned)buffer->bytesused);
-    }
-
-  frame = vision_camera_frame(camera, buffer);
-  if (frame == NULL || buffer->bytesused < 4 ||
-      buffer->bytesused > VISION_JPEG_MAX ||
-      frame[0] != 0xff || frame[1] != 0xd8 ||
-      frame[buffer->bytesused - 2] != 0xff ||
-      frame[buffer->bytesused - 1] != 0xd9)
-    {
-      ioctl(camera->fd, VIDIOC_QBUF, (uintptr_t)buffer);
-      return -EBADMSG;
-    }
-
-  return OK;
+  printf("[BlindBadge] camera: frame timeout discarded=%u\n", discarded);
+  return -ETIMEDOUT;
 }
 
 static int vision_camera_release(struct vision_camera_s *camera,
@@ -525,12 +618,21 @@ static int vision_handle_capture(int fd)
       return -ENODEV;
     }
 
+  ret = vision_camera_start(&g_server_camera);
+  if (ret < 0)
+    {
+      vision_send_text(fd, 503, "Service Unavailable", "text/plain",
+                       "BlindBadge camera start failed\n");
+      return ret;
+    }
+
   started = vision_monotonic_us();
   ret = vision_camera_capture(&g_server_camera, &buffer, true);
   printf("[BlindBadge] capture: camera_capture_ms=%lu ret=%d\n",
          (unsigned long)((vision_monotonic_us() - started) / 1000), ret);
   if (ret < 0)
     {
+      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge camera capture failed\n");
       return ret;
@@ -550,25 +652,44 @@ static int vision_handle_capture(int fd)
   if (jpeg == NULL)
     {
       vision_camera_release(&g_server_camera, &buffer);
+      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge JPEG allocation failed\n");
       return -ENOMEM;
     }
 
   memcpy(jpeg, frame, jpeg_size);
+  vision_log_heap("capture-before-close");
   ret = vision_camera_release(&g_server_camera, &buffer);
   if (ret < 0)
     {
       free(jpeg);
+      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge camera buffer release failed\n");
       return ret;
     }
 
+  ret = vision_camera_stop(&g_server_camera);
+  if (ret < 0)
+    {
+      free(jpeg);
+      vision_send_text(fd, 503, "Service Unavailable", "text/plain",
+                       "BlindBadge camera stop failed\n");
+      return ret;
+    }
+
+  started = vision_monotonic_us();
   ret = vision_send_all(fd, header, length);
+  printf("[BlindBadge] capture: header_send_ms=%lu ret=%d\n",
+         (unsigned long)((vision_monotonic_us() - started) / 1000), ret);
   if (ret == OK)
     {
+      started = vision_monotonic_us();
       ret = vision_send_all(fd, jpeg, jpeg_size);
+      printf("[BlindBadge] capture: jpeg_send_ms=%lu ret=%d\n",
+             (unsigned long)((vision_monotonic_us() - started) / 1000),
+             ret);
     }
 
   printf("[BlindBadge] capture: send completed ret=%d\n", ret);
@@ -613,6 +734,11 @@ static int vision_handle_stream(int fd)
     }
 
   ret = vision_send_all(fd, stream_header, sizeof(stream_header) - 1);
+  if (ret == OK)
+    {
+      ret = vision_camera_start(&g_server_camera);
+    }
+
   while (ret == OK && !g_server_stop)
     {
       ret = vision_camera_capture(&g_server_camera, &buffer, false);
@@ -655,6 +781,9 @@ static int vision_handle_stream(int fd)
     }
 
   free(jpeg);
+  vision_camera_stop(&g_server_camera);
+  printf("[BlindBadge] stream: ended ret=%d frames=%lu\n",
+         ret, g_frames);
   return ret;
 }
 
@@ -720,13 +849,20 @@ static int vision_handle_client(int fd)
 {
   char request[VISION_HTTP_REQUEST_MAX];
   struct timeval timeout;
+  int enabled = 1;
   int flags;
   ssize_t count;
 
-  timeout.tv_sec = 5;
-  timeout.tv_usec = 0;
+  timeout.tv_sec = VISION_HTTP_IO_TIMEOUT_MS / 1000;
+  timeout.tv_usec = (VISION_HTTP_IO_TIMEOUT_MS % 1000) * 1000;
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                 sizeof(enabled)) < 0)
+    {
+      printf("[BlindBadge] vision_server: TCP_NODELAY failed errno=%d\n",
+             errno);
+    }
 
   count = recv(fd, request, sizeof(request) - 1, 0);
   if (count <= 0)
@@ -776,9 +912,11 @@ int blind_badge_vision_server_run(int port)
 {
   struct sockaddr_in address;
   struct pollfd pollfd;
+  struct v4l2_buffer warmup_buffer;
   int reuse = 1;
   int client;
   int ret;
+  int stop_ret;
 
   if (port <= 0 || port > 65535)
     {
@@ -798,9 +936,10 @@ int blind_badge_vision_server_run(int port)
   g_last_error = 0;
   pthread_mutex_unlock(&g_server_lock);
 
-  /* Initialize and configure the camera before exposing the AP.  The server
-   * owns this camera for its full lifetime; requests only dequeue and requeue
-   * frames, so sensor and V4L2 queue setup never run on an active TCP request.
+  /* Initialize the camera once before exposing the AP.  Reusing one V4L2
+   * session avoids repeating sensor, DMA, and STREAMON/STREAMOFF setup in
+   * the request path, matching the persistent-camera strategy used by the
+   * reference delivery.
    */
 
   ret = vision_camera_open(&g_server_camera);
@@ -812,8 +951,40 @@ int blind_badge_vision_server_run(int port)
     }
 
   g_server_camera_ready = true;
-  printf("[BlindBadge] vision_server: persistent camera ready fd=%d\n",
+  printf("[BlindBadge] vision_server: camera mode=persistent fd=%d\n",
          g_server_camera.fd);
+
+  /* Prime the sensor and V4L2 ring before Wi-Fi DMA is enabled.  The first
+   * frame after a cold boot can be significantly delayed; consuming it here
+   * keeps the first HTTP stream deterministic without running camera DMA
+   * while the server is idle.
+   */
+
+  ret = vision_camera_start(&g_server_camera);
+  if (ret == OK)
+    {
+      ret = vision_camera_capture(&g_server_camera, &warmup_buffer, false);
+    }
+
+  if (ret == OK)
+    {
+      ret = vision_camera_release(&g_server_camera, &warmup_buffer);
+    }
+
+  stop_ret = vision_camera_stop(&g_server_camera);
+  if (ret == OK)
+    {
+      ret = stop_ret;
+    }
+
+  if (ret < 0)
+    {
+      printf("[BlindBadge] vision_server: camera warmup failed (%d)\n",
+             ret);
+      goto finished;
+    }
+
+  printf("[BlindBadge] vision_server: camera warmup complete\n");
 
   ret = vision_ap_start();
   if (ret < 0)
@@ -985,6 +1156,12 @@ int blind_badge_vision_camera_bench(unsigned int frames)
   uint64_t total_bytes = 0;
   uint64_t started;
   uint64_t elapsed;
+  uint64_t capture_elapsed;
+  uint64_t capture_total = 0;
+  uint64_t capture_min = UINT64_MAX;
+  uint64_t capture_max = 0;
+  uint64_t qbuf_started;
+  uint64_t qbuf_total = 0;
   unsigned int completed = 0;
   int ret;
 
@@ -1018,15 +1195,30 @@ int blind_badge_vision_camera_bench(unsigned int frames)
   started = vision_monotonic_us();
   while (completed < frames)
     {
+      capture_elapsed = vision_monotonic_us();
       ret = vision_camera_capture(&camera, &buffer, false);
+      capture_elapsed = vision_monotonic_us() - capture_elapsed;
       if (ret < 0)
         {
           break;
         }
 
+      capture_total += capture_elapsed;
+      if (capture_elapsed < capture_min)
+        {
+          capture_min = capture_elapsed;
+        }
+
+      if (capture_elapsed > capture_max)
+        {
+          capture_max = capture_elapsed;
+        }
+
       total_bytes += buffer.bytesused;
       completed++;
+      qbuf_started = vision_monotonic_us();
       ret = vision_camera_release(&camera, &buffer);
+      qbuf_total += vision_monotonic_us() - qbuf_started;
       if (ret < 0)
         {
           break;
@@ -1040,6 +1232,13 @@ int blind_badge_vision_camera_bench(unsigned int frames)
          elapsed == 0 ? 0 :
          (unsigned long)((uint64_t)completed * 100000000 / elapsed),
          completed == 0 ? 0 : (unsigned long)(total_bytes / completed), ret);
+  printf("[BlindBadge] camera_bench: capture_avg_us=%lu "
+         "capture_min_us=%lu capture_max_us=%lu qbuf_avg_us=%lu\n",
+         completed == 0 ? 0 :
+         (unsigned long)(capture_total / completed),
+         completed == 0 ? 0 : (unsigned long)capture_min,
+         completed == 0 ? 0 : (unsigned long)capture_max,
+         completed == 0 ? 0 : (unsigned long)(qbuf_total / completed));
   vision_camera_close(&camera);
   return completed == frames && ret == OK ? OK : ret;
 }
