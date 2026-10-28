@@ -1,4 +1,4 @@
-"""逐层探测 ESP32 MJPEG 流，精确定位"读不到帧"卡在哪一步。
+"""逐层探测 BlindBadge OpenVela V4L2 MJPEG 流。
 
 用法::
 
@@ -7,7 +7,7 @@
 
 探测思路
 --------
-ESP32 那套固件里 ``handleStream()`` 是个**阻塞循环**（``while (cl.connected())``），
+当前固件由 OpenVela V4L2 相机服务提供 ``/stream``、``/capture`` 和 ``/health``。
 它整段时间里 ``server.handleClient()`` 都不会被调用。所以：
 
 - 有别的客户端正在拉流（比如浏览器开着页面）时，新连接 TCP 能连上，
@@ -249,11 +249,11 @@ def _judge_stream(s: ProbeResult, host: str, port: int, path: str) -> bool:
     if s.head_bytes == 0:
         print("  ❌ TCP 连上了，但服务器**一个字节都没回**。")
         print()
-        print("  这不是 IP 写错（端口上确实有东西在监听）。ESP32 那套固件里")
-        print("  handleStream() 是阻塞循环，正在给别的客户端推流时，新连接会被挂起、")
-        print("  连响应头都不发。所以基本可以确定：**流已经被别人占住了**。")
+        print("  这不是 IP 写错（端口上确实有服务在监听）。当前 OpenVela 服务")
+        print("  可能尚未处理请求、已有旧连接未退出，或相机/V4L2 调用卡住。")
+        print("  仅凭这一现象不能认定是 Arduino handleStream() 或 ESP32 相机配置。")
         print()
-        print("  现在做交叉验证：试一下 /capture（它走 loop() 里的同步接口）")
+        print("  现在做交叉验证：试一下独立的 /capture 单帧接口")
         cap = fetch(host, port, "/capture", read_window=5.0)
         print(f"    /capture -> 响应头 {cap.head_bytes} 字节, "
               f"状态 {cap.status}, 响应体 {len(cap.body)} 字节")
@@ -263,15 +263,15 @@ def _judge_stream(s: ProbeResult, host: str, port: int, path: str) -> bool:
             print()
             print("  ✅ 板子活着、相机也正常（/capture 能出图"
                   + (f"，已存到 {saved}" if saved else "") + "）。")
-            print("     => 是 /stream 被占用了。按顺序试：")
+            print("     => 相机正常，优先检查 /stream 会话状态。按顺序试：")
             print("        1) 关掉所有开着 http://" + host + "/ 的浏览器标签页")
             print("        2) 关掉之前没退干净的视觉服务 / 标定窗口（含别的终端）")
             print("        3) 手机上如果开着板子页面，也关掉")
             print("        4) 还不行就拔电重上电，再立刻重试（最快）")
         elif cap.head_bytes == 0:
             print()
-            print("  ❌ /capture 也没响应 —— 板子**卡在推流循环里**了（旧的 TCP 连接还没超时）。")
-            print("     => 直接给板子断电，重新上电，然后立刻重试。")
+            print("  ❌ /capture 也没响应 —— HTTP 服务或相机调用已卡住。")
+            print("     => 记录串口日志后重启板子，再检查 /health；不要修改 Arduino 参数。")
         else:
             print()
             print("  ⚠️ /capture 有响应但不是 JPEG（状态 "
@@ -293,7 +293,7 @@ def _judge_stream(s: ProbeResult, host: str, port: int, path: str) -> bool:
     # ---------- 情况 5：200 + multipart，但没数据
     if n == 0:
         print("  ❌ 响应头完全正确，但响应体是空的（相机没出图 / 固件在送空帧）。")
-        print("     -> 回串口看有没有 'camera OK PSRAM'，以及是否在反复重启。")
+        print("     -> 查看 OpenVela 串口中的 camera/STREAMON/DQBUF 日志及重启信息。")
         return False
 
     # ---------- 情况 6：有数据但没有 JPEG
@@ -361,7 +361,7 @@ def _print_network_help(host: str) -> None:
 
 
 def main(argv: Optional[list] = None) -> int:
-    ap = argparse.ArgumentParser(description="ESP32 MJPEG 流逐层探测")
+    ap = argparse.ArgumentParser(description="BlindBadge OpenVela MJPEG 流逐层探测")
     ap.add_argument("target", help="mjpeg:http://ip/stream 或直接写 IP")
     args = ap.parse_args(argv)
     return probe(args.target)

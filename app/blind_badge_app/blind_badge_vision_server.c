@@ -53,6 +53,8 @@
 #define VISION_HTTP_IO_TIMEOUT_MS 1500
 #define VISION_HTTP_SEND_CHUNK 1400
 #define VISION_HTTP_SEND_DELAY_US 1000
+#define VISION_STREAM_STACK_SIZE 8192
+#define VISION_CLIENT_DETACHED 1
 #define VISION_FRAME_TIMEOUT_MS 1500
 #define VISION_FRAME_RETRY_US 10000
 #define VISION_NET_BENCH_BLOCK_SIZE 12288
@@ -81,11 +83,14 @@ struct vision_camera_s
  ****************************************************************************/
 
 static pthread_mutex_t g_server_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_stream_cond = PTHREAD_COND_INITIALIZER;
 static volatile bool g_server_running;
 static volatile bool g_server_stop;
 static int g_listen_fd = -1;
+static int g_stream_fd = -1;
 static struct vision_camera_s g_server_camera;
 static bool g_server_camera_ready;
+static bool g_stream_active;
 static int g_server_port = VISION_HTTP_DEFAULT_PORT;
 static unsigned long g_frames;
 static unsigned long g_clients;
@@ -97,6 +102,13 @@ static bool g_ap_running;
  ****************************************************************************/
 
 static uint64_t vision_monotonic_us(void);
+
+static void vision_count_frame(void)
+{
+  pthread_mutex_lock(&g_server_lock);
+  g_frames++;
+  pthread_mutex_unlock(&g_server_lock);
+}
 
 static void vision_log_heap(const char *stage)
 {
@@ -441,12 +453,11 @@ static int vision_camera_start(struct vision_camera_s *camera)
       return OK;
     }
 
-  /* Drain completed frames left by the preceding request.  Requeueing them
-   * before STREAMON gives V4L2 a clean set of writable containers while the
-   * sensor and allocated buffers remain persistent.
+  /* Drain completed frames left by an earlier start attempt.  Requeueing
+   * them before STREAMON gives V4L2 a clean set of writable containers.
    */
 
-  for (;;)
+  for (; ; )
     {
       memset(&buffer, 0, sizeof(buffer));
       buffer.type = camera->type;
@@ -478,27 +489,6 @@ static int vision_camera_start(struct vision_camera_s *camera)
 
   camera->streaming = true;
   printf("[BlindBadge] camera: STREAMON OK\n");
-  return OK;
-}
-
-static int vision_camera_stop(struct vision_camera_s *camera)
-{
-  int ret;
-
-  if (!camera->streaming)
-    {
-      return OK;
-    }
-
-  ret = ioctl(camera->fd, VIDIOC_STREAMOFF, (uintptr_t)&camera->type);
-  if (ret < 0)
-    {
-      printf("[BlindBadge] camera: STREAMOFF failed errno=%d\n", errno);
-      return -errno;
-    }
-
-  camera->streaming = false;
-  printf("[BlindBadge] camera: STREAMOFF OK\n");
   return OK;
 }
 
@@ -610,6 +600,11 @@ static int vision_handle_capture(int fd)
   size_t jpeg_size;
   int length;
   int ret;
+  bool stream_active;
+
+  pthread_mutex_lock(&g_server_lock);
+  stream_active = g_stream_active;
+  pthread_mutex_unlock(&g_server_lock);
 
   if (!g_server_camera_ready)
     {
@@ -618,12 +613,11 @@ static int vision_handle_capture(int fd)
       return -ENODEV;
     }
 
-  ret = vision_camera_start(&g_server_camera);
-  if (ret < 0)
+  if (stream_active)
     {
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
-                       "BlindBadge camera start failed\n");
-      return ret;
+                       "BlindBadge camera busy: stream active\n");
+      return -EBUSY;
     }
 
   started = vision_monotonic_us();
@@ -632,7 +626,6 @@ static int vision_handle_capture(int fd)
          (unsigned long)((vision_monotonic_us() - started) / 1000), ret);
   if (ret < 0)
     {
-      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge camera capture failed\n");
       return ret;
@@ -652,7 +645,6 @@ static int vision_handle_capture(int fd)
   if (jpeg == NULL)
     {
       vision_camera_release(&g_server_camera, &buffer);
-      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge JPEG allocation failed\n");
       return -ENOMEM;
@@ -664,18 +656,8 @@ static int vision_handle_capture(int fd)
   if (ret < 0)
     {
       free(jpeg);
-      vision_camera_stop(&g_server_camera);
       vision_send_text(fd, 503, "Service Unavailable", "text/plain",
                        "BlindBadge camera buffer release failed\n");
-      return ret;
-    }
-
-  ret = vision_camera_stop(&g_server_camera);
-  if (ret < 0)
-    {
-      free(jpeg);
-      vision_send_text(fd, 503, "Service Unavailable", "text/plain",
-                       "BlindBadge camera stop failed\n");
       return ret;
     }
 
@@ -697,7 +679,7 @@ static int vision_handle_capture(int fd)
 
   if (ret == OK)
     {
-      g_frames++;
+      vision_count_frame();
     }
 
   return ret;
@@ -734,10 +716,6 @@ static int vision_handle_stream(int fd)
     }
 
   ret = vision_send_all(fd, stream_header, sizeof(stream_header) - 1);
-  if (ret == OK)
-    {
-      ret = vision_camera_start(&g_server_camera);
-    }
 
   while (ret == OK && !g_server_stop)
     {
@@ -776,15 +754,78 @@ static int vision_handle_stream(int fd)
       if (ret == OK)
         {
           ret = vision_send_all(fd, "\r\n", 2);
-          g_frames++;
+          if (ret == OK)
+            {
+              vision_count_frame();
+            }
         }
     }
 
   free(jpeg);
-  vision_camera_stop(&g_server_camera);
   printf("[BlindBadge] stream: ended ret=%d frames=%lu\n",
          ret, g_frames);
   return ret;
+}
+
+static void *vision_stream_worker(void *arg)
+{
+  int fd = (int)(intptr_t)arg;
+  int ret;
+
+  ret = vision_handle_stream(fd);
+  shutdown(fd, SHUT_RDWR);
+  close(fd);
+
+  pthread_mutex_lock(&g_server_lock);
+  g_stream_fd = -1;
+  g_stream_active = false;
+  if (ret < 0 && ret != -EPIPE && ret != -ECONNRESET &&
+      ret != -ENOTCONN)
+    {
+      g_last_error = ret;
+    }
+
+  pthread_cond_broadcast(&g_stream_cond);
+  pthread_mutex_unlock(&g_server_lock);
+  return NULL;
+}
+
+static int vision_start_stream_worker(int fd)
+{
+  pthread_attr_t attr;
+  pthread_t thread;
+  int ret;
+
+  pthread_mutex_lock(&g_server_lock);
+  if (g_stream_active)
+    {
+      pthread_mutex_unlock(&g_server_lock);
+      vision_send_text(fd, 503, "Service Unavailable", "text/plain",
+                       "BlindBadge stream already active\n");
+      return -EBUSY;
+    }
+
+  g_stream_active = true;
+  g_stream_fd = fd;
+  pthread_mutex_unlock(&g_server_lock);
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, VISION_STREAM_STACK_SIZE);
+  ret = pthread_create(&thread, &attr, vision_stream_worker,
+                       (void *)(intptr_t)fd);
+  pthread_attr_destroy(&attr);
+  if (ret != 0)
+    {
+      pthread_mutex_lock(&g_server_lock);
+      g_stream_fd = -1;
+      g_stream_active = false;
+      pthread_cond_broadcast(&g_stream_cond);
+      pthread_mutex_unlock(&g_server_lock);
+      return -ret;
+    }
+
+  pthread_detach(thread);
+  return VISION_CLIENT_DETACHED;
 }
 
 static int vision_handle_net_bench(int fd)
@@ -848,9 +889,16 @@ static int vision_handle_net_bench(int fd)
 static int vision_handle_client(int fd)
 {
   char request[VISION_HTTP_REQUEST_MAX];
+  char health[256];
   struct timeval timeout;
+  unsigned long clients;
+  unsigned long frames;
+  bool camera_ready;
+  bool stream_active;
+  int last_error;
   int enabled = 1;
   int flags;
+  int length;
   ssize_t count;
 
   timeout.tv_sec = VISION_HTTP_IO_TIMEOUT_MS / 1000;
@@ -879,9 +927,28 @@ static int vision_handle_client(int fd)
 
   if (strncmp(request, "GET /health ", 12) == 0)
     {
-      return vision_send_text(fd, 200, "OK", "application/json",
-                              "{\"ok\":true,\"service\":"
-                              "\"blindbadge-vision\"}\n");
+      pthread_mutex_lock(&g_server_lock);
+      camera_ready = g_server_camera_ready;
+      stream_active = g_stream_active;
+      clients = g_clients;
+      frames = g_frames;
+      last_error = g_last_error;
+      pthread_mutex_unlock(&g_server_lock);
+
+      length = snprintf(health, sizeof(health),
+                        "{\"ok\":true,\"service\":"
+                        "\"blindbadge-vision\",\"camera_ready\":%s,"
+                        "\"stream_active\":%s,\"clients\":%lu,"
+                        "\"frames\":%lu,\"last_error\":%d}\n",
+                        camera_ready ? "true" : "false",
+                        stream_active ? "true" : "false",
+                        clients, frames, last_error);
+      if (length < 0 || length >= sizeof(health))
+        {
+          return -EOVERFLOW;
+        }
+
+      return vision_send_text(fd, 200, "OK", "application/json", health);
     }
 
   if (strncmp(request, "GET /capture ", 13) == 0)
@@ -891,7 +958,7 @@ static int vision_handle_client(int fd)
 
   if (strncmp(request, "GET /stream ", 12) == 0)
     {
-      return vision_handle_stream(fd);
+      return vision_start_stream_worker(fd);
     }
 
   if (strncmp(request, "GET /net_bench ", 15) == 0)
@@ -916,7 +983,6 @@ int blind_badge_vision_server_run(int port)
   int reuse = 1;
   int client;
   int ret;
-  int stop_ret;
 
   if (port <= 0 || port > 65535)
     {
@@ -934,6 +1000,8 @@ int blind_badge_vision_server_run(int port)
   g_server_stop = false;
   g_server_port = port;
   g_last_error = 0;
+  g_stream_fd = -1;
+  g_stream_active = false;
   pthread_mutex_unlock(&g_server_lock);
 
   /* Initialize the camera once before exposing the AP.  Reusing one V4L2
@@ -954,10 +1022,9 @@ int blind_badge_vision_server_run(int port)
   printf("[BlindBadge] vision_server: camera mode=persistent fd=%d\n",
          g_server_camera.fd);
 
-  /* Prime the sensor and V4L2 ring before Wi-Fi DMA is enabled.  The first
-   * frame after a cold boot can be significantly delayed; consuming it here
-   * keeps the first HTTP stream deterministic without running camera DMA
-   * while the server is idle.
+  /* Prime the sensor and keep the V4L2 ring running for the server lifetime.
+   * Repeated STREAMON/STREAMOFF transitions proved less reliable than
+   * continuously replacing old frames in ring mode.
    */
 
   ret = vision_camera_start(&g_server_camera);
@@ -969,12 +1036,6 @@ int blind_badge_vision_server_run(int port)
   if (ret == OK)
     {
       ret = vision_camera_release(&g_server_camera, &warmup_buffer);
-    }
-
-  stop_ret = vision_camera_stop(&g_server_camera);
-  if (ret == OK)
-    {
-      ret = stop_ret;
     }
 
   if (ret < 0)
@@ -1046,20 +1107,42 @@ int blind_badge_vision_server_run(int port)
           continue;
         }
 
+      pthread_mutex_lock(&g_server_lock);
       g_clients++;
+      pthread_mutex_unlock(&g_server_lock);
       ret = vision_handle_client(client);
-      close(client);
+      if (ret != VISION_CLIENT_DETACHED)
+        {
+          close(client);
+        }
+
       if (ret < 0 && ret != -EPIPE && ret != -ECONNRESET &&
-          ret != -ENOTCONN)
+          ret != -ENOTCONN && ret != -EBUSY)
         {
           printf("[BlindBadge] vision_server: request failed (%d)\n", ret);
+          pthread_mutex_lock(&g_server_lock);
           g_last_error = ret;
+          pthread_mutex_unlock(&g_server_lock);
         }
     }
 
   ret = OK;
 
 finished:
+  pthread_mutex_lock(&g_server_lock);
+  g_server_stop = true;
+  if (g_stream_fd >= 0)
+    {
+      shutdown(g_stream_fd, SHUT_RDWR);
+    }
+
+  while (g_stream_active)
+    {
+      pthread_cond_wait(&g_stream_cond, &g_server_lock);
+    }
+
+  pthread_mutex_unlock(&g_server_lock);
+
   if (g_listen_fd >= 0)
     {
       close(g_listen_fd);
@@ -1097,6 +1180,11 @@ int blind_badge_vision_server_stop(void)
       shutdown(g_listen_fd, SHUT_RDWR);
     }
 
+  if (g_stream_fd >= 0)
+    {
+      shutdown(g_stream_fd, SHUT_RDWR);
+    }
+
   pthread_mutex_unlock(&g_server_lock);
   return OK;
 }
@@ -1105,9 +1193,10 @@ int blind_badge_vision_server_status(void)
 {
   pthread_mutex_lock(&g_server_lock);
   printf("[BlindBadge] vision_server: %s ap=%s ip=%s port=%d "
-         "clients=%lu frames=%lu error=%d\n",
+         "stream=%s clients=%lu frames=%lu error=%d\n",
          g_server_running ? "RUNNING" : "STOPPED",
          VISION_AP_SSID, VISION_AP_ADDR, g_server_port,
+         g_stream_active ? "ACTIVE" : "IDLE",
          g_clients, g_frames, g_last_error);
   pthread_mutex_unlock(&g_server_lock);
   return OK;
