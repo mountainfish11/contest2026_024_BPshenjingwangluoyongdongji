@@ -8,6 +8,8 @@
 
 #include "blind_badge_vision_server.h"
 
+#include "infra/network_manager.h"
+
 #include <nuttx/config.h>
 #include <nuttx/video/v4l2_cap.h>
 #include <nuttx/video/video.h>
@@ -41,7 +43,6 @@
 #ifdef CONFIG_ESP32S3_WIFI_SOFTAP
 #  define VISION_AP_IFNAME "wlan0"
 #else
-#  define VISION_AP_IFNAME "wlan1"
 #  define VISION_STA_IFNAME "wlan0"
 #endif
 #define VISION_AP_SSID "BlindBadge-Vision"
@@ -49,11 +50,13 @@
 #define VISION_AP_NETMASK "255.255.255.0"
 #define VISION_HTTP_DEFAULT_PORT 80
 #define VISION_HTTP_BACKLOG 2
+#define VISION_STA_RETRY_DELAY_SEC 2
 #define VISION_HTTP_REQUEST_MAX 512
 #define VISION_HTTP_IO_TIMEOUT_MS 1500
 #define VISION_HTTP_SEND_CHUNK 1400
 #define VISION_HTTP_SEND_DELAY_US 1000
 #define VISION_STREAM_STACK_SIZE 8192
+#define VISION_STREAM_PRIORITY 254
 #define VISION_CLIENT_DETACHED 1
 #define VISION_FRAME_TIMEOUT_MS 1500
 #define VISION_FRAME_RETRY_US 10000
@@ -63,7 +66,7 @@
 #define VISION_WIDTH 640
 #define VISION_HEIGHT 480
 #define VISION_JPEG_MAX (128 * 1024)
-#define VISION_CAMERA_BUFFERS 2
+#define VISION_CAMERA_BUFFERS 3
 
 /****************************************************************************
  * Private Types
@@ -95,7 +98,10 @@ static int g_server_port = VISION_HTTP_DEFAULT_PORT;
 static unsigned long g_frames;
 static unsigned long g_clients;
 static int g_last_error;
+#ifdef CONFIG_ESP32S3_WIFI_SOFTAP
 static bool g_ap_running;
+#endif
+static char g_network_addr[INET_ADDRSTRLEN] = "0.0.0.0";
 
 /****************************************************************************
  * Private Functions
@@ -133,8 +139,6 @@ static int vision_send_all(int fd, const void *data, size_t length)
       ssize_t ret = send(fd, cursor + sent, chunk, 0);
       if (ret == 0)
         {
-          printf("[BlindBadge] send: peer closed sent=%u total=%u\n",
-                 (unsigned)sent, (unsigned)length);
           return -EPIPE;
         }
 
@@ -156,14 +160,9 @@ static int vision_send_all(int fd, const void *data, size_t length)
                   continue;
                 }
 
-              printf("[BlindBadge] send: poll failed sent=%u total=%u "
-                     "waitret=%d errno=%d\n",
-                     (unsigned)sent, (unsigned)length, waitret, errno);
               return waitret == 0 ? -ETIMEDOUT : -errno;
             }
 
-          printf("[BlindBadge] send: failed sent=%u total=%u errno=%d\n",
-                 (unsigned)sent, (unsigned)length, errno);
           return -errno;
         }
 
@@ -199,8 +198,9 @@ static int vision_send_text(int fd, int status, const char *reason,
   return ret < 0 ? ret : vision_send_all(fd, body, strlen(body));
 }
 
-static int vision_ap_start(void)
+static int vision_network_start(void)
 {
+#ifdef CONFIG_ESP32S3_WIFI_SOFTAP
   struct in_addr address;
   struct in_addr netmask;
   int sock;
@@ -279,6 +279,7 @@ static int vision_ap_start(void)
 
   printf("[BlindBadge] vision_server: AP %s at %s ready\n",
          VISION_AP_SSID, VISION_AP_ADDR);
+  strlcpy(g_network_addr, VISION_AP_ADDR, sizeof(g_network_addr));
   return OK;
 
 errout:
@@ -286,10 +287,43 @@ errout:
   netlib_ifdown(VISION_AP_IFNAME);
   g_ap_running = false;
   return ret;
+#else
+  struct in_addr address;
+  unsigned int attempt = 0;
+  int ret;
+
+  while (!g_server_stop)
+    {
+      attempt++;
+      if (network_is_connected())
+        {
+          ret = netlib_get_ipv4addr(VISION_STA_IFNAME, &address);
+          if (ret == OK && address.s_addr != INADDR_ANY &&
+              inet_ntop(AF_INET, &address, g_network_addr,
+                        sizeof(g_network_addr)) != NULL)
+            {
+              printf("[BlindBadge] vision_server: STA ready at %s\n",
+                     g_network_addr);
+              return OK;
+            }
+        }
+
+      if (attempt == 1 || attempt % 10 == 0)
+        {
+          printf("[BlindBadge] vision_server: waiting for STA IPv4 "
+                 "attempt=%u\n", attempt);
+        }
+
+      sleep(VISION_STA_RETRY_DELAY_SEC);
+    }
+
+  return -ECANCELED;
+#endif
 }
 
-static void vision_ap_stop(void)
+static void vision_network_stop(void)
 {
+#ifdef CONFIG_ESP32S3_WIFI_SOFTAP
   if (g_ap_running)
     {
       dhcpd_stop();
@@ -297,6 +331,7 @@ static void vision_ap_stop(void)
       g_ap_running = false;
       printf("[BlindBadge] vision_server: AP stopped\n");
     }
+#endif
 }
 
 static int vision_camera_open(struct vision_camera_s *camera)
@@ -539,8 +574,6 @@ static int vision_camera_capture(struct vision_camera_s *camera,
         {
           if (errno != EAGAIN && errno != EWOULDBLOCK)
             {
-              printf("[BlindBadge] camera: DQBUF failed errno=%d\n",
-                     errno);
               return -errno;
             }
 
@@ -569,13 +602,10 @@ static int vision_camera_capture(struct vision_camera_s *camera,
       ret = ioctl(camera->fd, VIDIOC_QBUF, (uintptr_t)buffer);
       if (ret < 0)
         {
-          printf("[BlindBadge] camera: invalid frame QBUF failed "
-                 "errno=%d\n", errno);
           return -errno;
         }
     }
 
-  printf("[BlindBadge] camera: frame timeout discarded=%u\n", discarded);
   return -ETIMEDOUT;
 }
 
@@ -762,8 +792,6 @@ static int vision_handle_stream(int fd)
     }
 
   free(jpeg);
-  printf("[BlindBadge] stream: ended ret=%d frames=%lu\n",
-         ret, g_frames);
   return ret;
 }
 
@@ -771,6 +799,8 @@ static void *vision_stream_worker(void *arg)
 {
   int fd = (int)(intptr_t)arg;
   int ret;
+
+  pthread_setschedprio(pthread_self(), VISION_STREAM_PRIORITY);
 
   ret = vision_handle_stream(fd);
   shutdown(fd, SHUT_RDWR);
@@ -1004,7 +1034,8 @@ int blind_badge_vision_server_run(int port)
   g_stream_active = false;
   pthread_mutex_unlock(&g_server_lock);
 
-  /* Initialize the camera once before exposing the AP.  Reusing one V4L2
+  /* Initialize the camera once before exposing the network server.  Reusing
+   * one V4L2
    * session avoids repeating sensor, DMA, and STREAMON/STREAMOFF setup in
    * the request path, matching the persistent-camera strategy used by the
    * reference delivery.
@@ -1021,6 +1052,18 @@ int blind_badge_vision_server_run(int port)
   g_server_camera_ready = true;
   printf("[BlindBadge] vision_server: camera mode=persistent fd=%d\n",
          g_server_camera.fd);
+
+#ifndef CONFIG_ESP32S3_WIFI_SOFTAP
+  /* Initialize the sensor before enabling Wi-Fi, but do not start the frame
+   * ring while waiting for the operator to connect STA from NSH.
+   */
+
+  ret = vision_network_start();
+  if (ret < 0)
+    {
+      goto finished;
+    }
+#endif
 
   /* Prime the sensor and keep the V4L2 ring running for the server lifetime.
    * Repeated STREAMON/STREAMOFF transitions proved less reliable than
@@ -1047,11 +1090,13 @@ int blind_badge_vision_server_run(int port)
 
   printf("[BlindBadge] vision_server: camera warmup complete\n");
 
-  ret = vision_ap_start();
+#ifdef CONFIG_ESP32S3_WIFI_SOFTAP
+  ret = vision_network_start();
   if (ret < 0)
     {
       goto finished;
     }
+#endif
 
   g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (g_listen_fd < 0)
@@ -1073,7 +1118,7 @@ int blind_badge_vision_server_run(int port)
     }
 
   printf("[BlindBadge] vision_server: http://%s:%d/stream\n",
-         VISION_AP_ADDR, port);
+         g_network_addr, port);
   while (!g_server_stop)
     {
       pollfd.fd = g_listen_fd;
@@ -1155,7 +1200,7 @@ finished:
       g_server_camera_ready = false;
     }
 
-  vision_ap_stop();
+  vision_network_stop();
 
   pthread_mutex_lock(&g_server_lock);
   g_server_running = false;
@@ -1192,10 +1237,15 @@ int blind_badge_vision_server_stop(void)
 int blind_badge_vision_server_status(void)
 {
   pthread_mutex_lock(&g_server_lock);
-  printf("[BlindBadge] vision_server: %s ap=%s ip=%s port=%d "
+  printf("[BlindBadge] vision_server: %s network=%s ip=%s port=%d "
          "stream=%s clients=%lu frames=%lu error=%d\n",
          g_server_running ? "RUNNING" : "STOPPED",
-         VISION_AP_SSID, VISION_AP_ADDR, g_server_port,
+#ifdef CONFIG_ESP32S3_WIFI_SOFTAP
+         "softap",
+#else
+         "station",
+#endif
+         g_network_addr, g_server_port,
          g_stream_active ? "ACTIVE" : "IDLE",
          g_clients, g_frames, g_last_error);
   pthread_mutex_unlock(&g_server_lock);
