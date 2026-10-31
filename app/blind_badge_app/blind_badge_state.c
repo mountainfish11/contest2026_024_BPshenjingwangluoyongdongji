@@ -6,6 +6,7 @@
 #include "blind_badge_display.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -74,7 +75,9 @@ int blind_badge_state_parse(const char *name, enum blind_badge_state *state)
   return -EINVAL;
 }
 
-int blind_badge_state_set(enum blind_badge_state state, const char *detail)
+static int blind_badge_state_set_internal(enum blind_badge_state state,
+                                          const char *detail,
+                                          bool log_transition)
 {
   enum blind_badge_state previous;
   unsigned long sequence;
@@ -92,14 +95,28 @@ int blind_badge_state_set(enum blind_badge_state state, const char *detail)
   sequence = ++g_state_sequence;
   pthread_mutex_unlock(&g_state_lock);
 
-  printf("[BlindBadge] state: #%lu %s -> %s detail=%s\n",
-         sequence, blind_badge_state_name(previous),
-         blind_badge_state_name(state),
-         safe_detail[0] != '\0' ? safe_detail : "none");
+  if (log_transition)
+    {
+      printf("[BlindBadge] state: #%lu %s -> %s detail=%s\n",
+             sequence, blind_badge_state_name(previous),
+             blind_badge_state_name(state),
+             safe_detail[0] != '\0' ? safe_detail : "none");
+    }
 
   return blind_badge_display_show_lines("MAIN STATE",
                                         blind_badge_state_name(state),
                                         safe_detail, "");
+}
+
+int blind_badge_state_set(enum blind_badge_state state, const char *detail)
+{
+  return blind_badge_state_set_internal(state, detail, true);
+}
+
+int blind_badge_state_set_quiet(enum blind_badge_state state,
+                                const char *detail)
+{
+  return blind_badge_state_set_internal(state, detail, false);
 }
 
 int blind_badge_state_show(void)

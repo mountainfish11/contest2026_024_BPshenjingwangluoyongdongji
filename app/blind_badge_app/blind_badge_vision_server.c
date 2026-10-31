@@ -289,12 +289,10 @@ errout:
   return ret;
 #else
   struct in_addr address;
-  unsigned int attempt = 0;
   int ret;
 
   while (!g_server_stop)
     {
-      attempt++;
       if (network_is_connected())
         {
           ret = netlib_get_ipv4addr(VISION_STA_IFNAME, &address);
@@ -306,12 +304,6 @@ errout:
                      g_network_addr);
               return OK;
             }
-        }
-
-      if (attempt == 1 || attempt % 10 == 0)
-        {
-          printf("[BlindBadge] vision_server: waiting for STA IPv4 "
-                 "attempt=%u\n", attempt);
         }
 
       sleep(VISION_STA_RETRY_DELAY_SEC);

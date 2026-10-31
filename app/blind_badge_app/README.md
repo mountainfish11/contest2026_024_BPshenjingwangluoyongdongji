@@ -48,7 +48,7 @@ U+303F 中日韩标点以及 U+FF01 至 U+FF60 全角字符，支持普通语音
 区间外的字符仍显示问号。字库由 `tools/generate_lcd_font.py` 使用 Pillow
 和文泉驿正黑生成，授权说明见 `app/blind_badge_app/FONT-LICENSE.txt`。
 
-## 主板状态机与 BOOT 按键
+## 主板状态机与按键
 
 主板状态统一为 `IDLE`、`LISTENING`、`RECORDING`、`CAPTURING`、
 `PROCESSING`、`RESULT`、`OFFLINE`、`ERROR` 和 `EMERGENCY`。状态变化会
@@ -68,6 +68,19 @@ ESP32-S3-EYE 的 BOOT 键：
 - 双击：显示“重复上次提醒”请求并向副板发送短震标志；
 - 长按 1.5 秒：触发本地 `EMERGENCY` 事件，下发强震和紧急发送标志；
 - 双击目前只确认重复请求，尚未配置扬声器，因此不会伪装成已经播放语音。
+
+同一个服务还通过 `/dev/adc0` 读取 GPIO1（ADC1_CH0）上的功能键电阻梯形网络。
+其中 DN- 键用于手动控制 Wi-Fi：
+
+- 单击 DN-：首次按下时挂载板载 MicroSD，并使用卡根目录 `WIFI.CFG`
+  中的凭据连接 Wi-Fi；
+- 双击 DN-：断开 Wi-Fi，但不删除已保存的凭据，之后仍可再次单击连接；
+- 单击动作会等待 1200 ms 的双击判定窗口，因此不会与双击动作同时执行；
+- 按键控制路径不依赖 USB 串口输出，关闭串口终端后仍可连接或断开；
+- `WIFI.CFG` 使用两行 `SSID=<网络名>` 和 `PASSWORD=<密码>`；固件不会把
+  内容打印到串口，也不会把凭据写入源码或内部 Flash；
+- 主板上电仅自动启动按键服务，不自动启动视觉服务器或连接 Wi-Fi；
+- 若 ADC 设备初始化失败，BOOT 键功能仍可继续使用，串口会输出诊断信息。
 
 ## AI 闭环
 

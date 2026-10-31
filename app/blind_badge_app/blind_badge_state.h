@@ -22,6 +22,8 @@ enum blind_badge_state blind_badge_state_get(void);
 const char *blind_badge_state_name(enum blind_badge_state state);
 int blind_badge_state_parse(const char *name, enum blind_badge_state *state);
 int blind_badge_state_set(enum blind_badge_state state, const char *detail);
+int blind_badge_state_set_quiet(enum blind_badge_state state,
+                                const char *detail);
 int blind_badge_state_show(void);
 
 #endif /* BLIND_BADGE_STATE_H */

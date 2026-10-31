@@ -22,6 +22,11 @@
 #  include <nuttx/input/buttons.h>
 #endif
 
+#ifdef CONFIG_ADC
+#  include <nuttx/analog/adc.h>
+#  include <nuttx/analog/ioctl.h>
+#endif
+
 #ifdef CONFIG_SYSTEM_NXRECORDER
 #  include <nuttx/audio/audio.h>
 #  include <system/nxrecorder.h>
@@ -42,8 +47,13 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/mount.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <nuttx/fs/ioctl.h>
 
 #define BLIND_BADGE_TEXT_SIZE 512
 #define BLIND_BADGE_WIFI_UI_TIMEOUT_SECONDS 60
@@ -60,8 +70,19 @@
 #define BLIND_BADGE_BUTTON_DEVICE "/dev/buttons"
 #define BLIND_BADGE_BUTTON_POLL_MS 20
 #define BLIND_BADGE_BUTTON_DOUBLE_MS 350
+#define BLIND_BADGE_BUTTON_DN_DOUBLE_MS 1200
 #define BLIND_BADGE_BUTTON_LONG_MS 1500
 #define BLIND_BADGE_BUTTON_VOICE_STACK_SIZE 16384
+#define BLIND_BADGE_BUTTON_WIFI_STACK_SIZE 8192
+#define BLIND_BADGE_BUTTON_ADC_DEVICE "/dev/adc0"
+#define BLIND_BADGE_BUTTON_DN_MIN_MV 900
+#define BLIND_BADGE_BUTTON_DN_MAX_MV 1300
+#define BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES 3
+#define BLIND_BADGE_WIFI_SD_BLOCK_DEVICE "/dev/mmcsd1"
+#define BLIND_BADGE_WIFI_SD_MOUNT_POINT "/mnt/sdcard"
+#define BLIND_BADGE_WIFI_SD_CONFIG "/mnt/sdcard/WIFI.CFG"
+#define BLIND_BADGE_WIFI_SSID_SIZE 33
+#define BLIND_BADGE_WIFI_PASSWORD_SIZE 64
 #define BLIND_BADGE_VISION_DEFAULT_PORT 45681
 #define BLIND_BADGE_VISION_HTTP_DEFAULT_PORT 80
 
@@ -1363,6 +1384,9 @@ static int handle_emergency(int argc,
 static volatile int g_button_service_running;
 static pthread_mutex_t g_button_voice_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_button_voice_running;
+static pthread_mutex_t g_button_wifi_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_button_wifi_running;
+static bool g_wifi_sd_mounted;
 
 static void *button_voice_worker(void *arg)
 {
@@ -1425,6 +1449,283 @@ static int start_button_voice_worker(void)
   return 0;
 }
 
+static void blind_badge_wifi_strip_line_end(char *line)
+{
+  size_t length = strlen(line);
+
+  while (length > 0 &&
+         (line[length - 1] == '\r' || line[length - 1] == '\n'))
+    {
+      line[--length] = '\0';
+    }
+}
+
+static int blind_badge_wifi_mount_sd(void)
+{
+#if defined(CONFIG_ESP32S3_SDMMC) && defined(CONFIG_FS_FAT)
+  struct stat file_stat;
+  int probe_fd;
+  int probe_ret = ERROR;
+  int attempt;
+
+  if (g_wifi_sd_mounted)
+    {
+      return OK;
+    }
+
+  mkdir("/mnt", 0755);
+  mkdir(BLIND_BADGE_WIFI_SD_MOUNT_POINT, 0755);
+
+  for (attempt = 0; attempt < 50; attempt++)
+    {
+      if (stat(BLIND_BADGE_WIFI_SD_BLOCK_DEVICE, &file_stat) == 0)
+        {
+          break;
+        }
+
+      usleep(100000);
+    }
+
+  if (attempt == 50)
+    {
+      return ERROR;
+    }
+
+  probe_fd = open(BLIND_BADGE_WIFI_SD_BLOCK_DEVICE, O_RDONLY);
+  if (probe_fd < 0)
+    {
+      return ERROR;
+    }
+
+  /* The block node is registered even when the card's power-on probe has
+   * not completed successfully.  Re-probe explicitly before FAT touches
+   * the device.  This board has no card-detect signal, so each BIOC_PROBE
+   * performs a real probe rather than trusting a stale insertion state.
+   */
+
+  for (attempt = 0; attempt < 10; attempt++)
+    {
+      probe_ret = ioctl(probe_fd, BIOC_PROBE, 0);
+      if (probe_ret == OK)
+        {
+          break;
+        }
+
+      usleep(500000);
+    }
+
+  close(probe_fd);
+  if (probe_ret != OK)
+    {
+      return ERROR;
+    }
+
+  if (mount(BLIND_BADGE_WIFI_SD_BLOCK_DEVICE,
+            BLIND_BADGE_WIFI_SD_MOUNT_POINT, "vfat", 0, NULL) < 0 &&
+      errno != EBUSY)
+    {
+      return ERROR;
+    }
+
+  g_wifi_sd_mounted = true;
+  return OK;
+#else
+  return ERROR;
+#endif
+}
+
+static int blind_badge_wifi_load_sd_config(char *ssid, size_t ssid_size,
+                                           char *password,
+                                           size_t password_size)
+{
+  char line[128];
+  bool have_ssid = false;
+  bool have_password = false;
+  FILE *file;
+
+  if (blind_badge_wifi_mount_sd() != OK)
+    {
+      return ERROR;
+    }
+
+  file = fopen(BLIND_BADGE_WIFI_SD_CONFIG, "r");
+  if (file == NULL)
+    {
+      return ERROR;
+    }
+
+  while (fgets(line, sizeof(line), file) != NULL)
+    {
+      char *entry = line;
+      size_t value_length;
+
+      blind_badge_wifi_strip_line_end(line);
+      if (strlen(entry) >= 3 &&
+          (unsigned char)entry[0] == 0xef &&
+          (unsigned char)entry[1] == 0xbb &&
+          (unsigned char)entry[2] == 0xbf)
+        {
+          entry += 3;
+        }
+
+      if (strncmp(entry, "SSID=", 5) == 0)
+        {
+          value_length = strlen(entry + 5);
+          if (value_length == 0 || value_length >= ssid_size)
+            {
+              fclose(file);
+              return ERROR;
+            }
+
+          memcpy(ssid, entry + 5, value_length + 1);
+          have_ssid = true;
+        }
+      else if (strncmp(entry, "PASSWORD=", 9) == 0)
+        {
+          value_length = strlen(entry + 9);
+          if (value_length >= password_size ||
+              (value_length > 0 && value_length < 8))
+            {
+              fclose(file);
+              return ERROR;
+            }
+
+          memcpy(password, entry + 9, value_length + 1);
+          have_password = true;
+        }
+    }
+
+  fclose(file);
+  return have_ssid && have_password ? OK : ERROR;
+}
+
+static void *button_wifi_connect_worker(void *arg)
+{
+  char ssid[BLIND_BADGE_WIFI_SSID_SIZE] = {0};
+  char password[BLIND_BADGE_WIFI_PASSWORD_SIZE] = {0};
+  int ret = ERROR;
+
+  (void)arg;
+  blind_badge_display_show_boot_status(-1);
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  if (network_is_connected())
+    {
+      ret = OK;
+    }
+  else if (blind_badge_wifi_load_sd_config(ssid, sizeof(ssid),
+                                           password, sizeof(password)) == OK)
+    {
+      ret = network_wifi_connect_boot(NULL, ssid, password);
+    }
+#endif
+
+  memset(password, 0, sizeof(password));
+  memset(ssid, 0, sizeof(ssid));
+
+  if (ret == OK)
+    {
+      blind_badge_state_set_quiet(BLIND_BADGE_STATE_IDLE,
+                                  "DN WiFi connected");
+      blind_badge_display_show_boot_status(1);
+    }
+  else
+    {
+      blind_badge_state_set_quiet(BLIND_BADGE_STATE_OFFLINE,
+                                  "DN WiFi connect failed");
+      blind_badge_display_show_boot_status(0);
+    }
+
+  pthread_mutex_lock(&g_button_wifi_lock);
+  g_button_wifi_running = 0;
+  pthread_mutex_unlock(&g_button_wifi_lock);
+  return NULL;
+}
+
+static int start_button_wifi_connect_worker(void)
+{
+  pthread_attr_t attr;
+  pthread_t thread;
+  int ret;
+
+  pthread_mutex_lock(&g_button_wifi_lock);
+  if (g_button_wifi_running)
+    {
+      pthread_mutex_unlock(&g_button_wifi_lock);
+      printf("[BlindBadge] button.dn: WiFi action already running\n");
+      return -EBUSY;
+    }
+
+  g_button_wifi_running = 1;
+  pthread_mutex_unlock(&g_button_wifi_lock);
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, BLIND_BADGE_BUTTON_WIFI_STACK_SIZE);
+  ret = pthread_create(&thread, &attr, button_wifi_connect_worker, NULL);
+  pthread_attr_destroy(&attr);
+  if (ret != 0)
+    {
+      pthread_mutex_lock(&g_button_wifi_lock);
+      g_button_wifi_running = 0;
+      pthread_mutex_unlock(&g_button_wifi_lock);
+      printf("[BlindBadge] button.dn: worker start failed: %d\n", ret);
+      return -ret;
+    }
+
+  pthread_detach(thread);
+  return 0;
+}
+
+static void handle_dn_short_press(void)
+{
+  (void)start_button_wifi_connect_worker();
+}
+
+static void handle_dn_double_press(void)
+{
+  int ret = ERROR;
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  ret = network_wifi_disconnect(NULL);
+#endif
+  if (ret == OK ||
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+      !network_is_connected()
+#else
+      false
+#endif
+      )
+    {
+      blind_badge_state_set_quiet(BLIND_BADGE_STATE_OFFLINE,
+                                  "DN WiFi disconnected");
+      blind_badge_display_show_boot_status(0);
+    }
+}
+
+#ifdef CONFIG_ADC
+static int read_dn_button(int fd, bool *pressed)
+{
+  struct adc_msg_s sample;
+  ssize_t nread;
+
+  if (ioctl(fd, ANIOC_TRIGGER, 0) < 0)
+    {
+      return -errno;
+    }
+
+  nread = read(fd, &sample, sizeof(sample));
+  if (nread != sizeof(sample))
+    {
+      return nread < 0 ? -errno : -EIO;
+    }
+
+  *pressed = sample.am_channel == 0 &&
+             sample.am_data >= BLIND_BADGE_BUTTON_DN_MIN_MV &&
+             sample.am_data <= BLIND_BADGE_BUTTON_DN_MAX_MV;
+  return 0;
+}
+#endif
+
 static uint64_t monotonic_milliseconds(void)
 {
   struct timespec now;
@@ -1481,6 +1782,14 @@ static int handle_button_service(int argc)
   uint64_t press_started_ms = 0;
   uint64_t click_deadline_ms = 0;
   int fd;
+#ifdef CONFIG_ADC
+  bool dn_pressed = false;
+  bool dn_candidate = false;
+  int dn_stable_samples = 0;
+  int dn_pending_clicks = 0;
+  uint64_t dn_click_deadline_ms = 0;
+  int adc_fd = -1;
+#endif
 
   if (argc != 2)
     {
@@ -1504,11 +1813,17 @@ static int handle_button_service(int argc)
       return 1;
     }
 
+#ifdef CONFIG_ADC
+  adc_fd = open(BLIND_BADGE_BUTTON_ADC_DEVICE, O_RDONLY);
+  if (adc_fd < 0)
+    {
+      printf("[BlindBadge] button_service: open %s failed: errno=%d; "
+             "BOOT key remains available\n",
+             BLIND_BADGE_BUTTON_ADC_DEVICE, errno);
+    }
+#endif
+
   g_button_service_running = 1;
-  printf("[BlindBadge] button_service: started device=%s short=<%dms "
-         "double=%dms long=%dms\n",
-         BLIND_BADGE_BUTTON_DEVICE, BLIND_BADGE_BUTTON_LONG_MS,
-         BLIND_BADGE_BUTTON_DOUBLE_MS, BLIND_BADGE_BUTTON_LONG_MS);
 
   while (g_button_service_running)
     {
@@ -1564,9 +1879,69 @@ static int handle_button_service(int argc)
           handle_button_short_press();
         }
 
+#ifdef CONFIG_ADC
+      if (adc_fd >= 0)
+        {
+          bool dn_raw_pressed = false;
+          int adc_ret;
+
+          adc_ret = read_dn_button(adc_fd, &dn_raw_pressed);
+          if (adc_ret == 0)
+            {
+              if (dn_raw_pressed == dn_candidate)
+                {
+                  if (dn_stable_samples <
+                      BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES)
+                    {
+                      dn_stable_samples++;
+                    }
+                }
+              else
+                {
+                  dn_candidate = dn_raw_pressed;
+                  dn_stable_samples = 1;
+                }
+
+              if (dn_stable_samples >=
+                  BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES &&
+                  dn_candidate != dn_pressed)
+                {
+                  dn_pressed = dn_candidate;
+                  if (!dn_pressed)
+                    {
+                      dn_pending_clicks++;
+                      if (dn_pending_clicks >= 2)
+                        {
+                          dn_pending_clicks = 0;
+                          handle_dn_double_press();
+                        }
+                      else
+                        {
+                          dn_click_deadline_ms =
+                            now_ms + BLIND_BADGE_BUTTON_DN_DOUBLE_MS;
+                        }
+                    }
+                }
+            }
+        }
+
+      if (!dn_pressed && dn_pending_clicks == 1 &&
+          now_ms >= dn_click_deadline_ms)
+        {
+          dn_pending_clicks = 0;
+          handle_dn_short_press();
+        }
+#endif
+
       usleep(BLIND_BADGE_BUTTON_POLL_MS * 1000);
     }
 
+#ifdef CONFIG_ADC
+  if (adc_fd >= 0)
+    {
+      close(adc_fd);
+    }
+#endif
   close(fd);
   g_button_service_running = 0;
   printf("[BlindBadge] button_service: stopped\n");
