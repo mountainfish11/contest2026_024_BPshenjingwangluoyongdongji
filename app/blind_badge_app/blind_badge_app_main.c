@@ -7,7 +7,9 @@
 #include "blind_badge_display.h"
 #include "blind_badge_event.h"
 #include "blind_badge_fall.h"
+#include "blind_badge_menu.h"
 #include "blind_badge_policy.h"
+#include "blind_badge_service.h"
 #include "blind_badge_skill.h"
 #include "blind_badge_state.h"
 #include "blind_badge_vision.h"
@@ -77,7 +79,12 @@
 #define BLIND_BADGE_BUTTON_ADC_DEVICE "/dev/adc0"
 #define BLIND_BADGE_BUTTON_DN_MIN_MV 900
 #define BLIND_BADGE_BUTTON_DN_MAX_MV 1300
+#define BLIND_BADGE_BUTTON_MENU_MIN_MV 2050
+#define BLIND_BADGE_BUTTON_MENU_MAX_MV 2250
+#define BLIND_BADGE_BUTTON_PLAY_MIN_MV 1750
+#define BLIND_BADGE_BUTTON_PLAY_MAX_MV 1950
 #define BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES 3
+#define BLIND_BADGE_BUTTON_PLAY_DOUBLE_MS 600
 #define BLIND_BADGE_WIFI_SD_BLOCK_DEVICE "/dev/mmcsd1"
 #define BLIND_BADGE_WIFI_SD_MOUNT_POINT "/mnt/sdcard"
 #define BLIND_BADGE_WIFI_SD_CONFIG "/mnt/sdcard/WIFI.CFG"
@@ -106,6 +113,8 @@ static void print_help(void)
   printf("  blind_badge_app boot_timeout\n");
   printf("  blind_badge_app state [STATE]\n");
   printf("  blind_badge_app button_service|button_stop|button_status\n");
+  printf("  blind_badge_app menu_show|menu_next|menu_status\n");
+  printf("  blind_badge_app play|back|service_status\n");
   printf("  blind_badge_app lcd_test [zh]\n");
   printf("  blind_badge_app mic_record [seconds] [16bit_pcm_file]\n");
   printf("  blind_badge_app mic_stats <16bit_pcm_file>\n");
@@ -1625,6 +1634,11 @@ static void *button_wifi_connect_worker(void *arg)
 
   if (ret == OK)
     {
+      if (UART_LINK_Start() != 0)
+        {
+          printf("[BlindBadge] button.dn: link service start failed\n");
+        }
+
       blind_badge_state_set_quiet(BLIND_BADGE_STATE_IDLE,
                                   "DN WiFi connected");
       blind_badge_display_show_boot_status(1);
@@ -1635,6 +1649,9 @@ static void *button_wifi_connect_worker(void *arg)
                                   "DN WiFi connect failed");
       blind_badge_display_show_boot_status(0);
     }
+
+  usleep(800000);
+  blind_badge_menu_show();
 
   pthread_mutex_lock(&g_button_wifi_lock);
   g_button_wifi_running = 0;
@@ -1698,12 +1715,27 @@ static void handle_dn_double_press(void)
     {
       blind_badge_state_set_quiet(BLIND_BADGE_STATE_OFFLINE,
                                   "DN WiFi disconnected");
-      blind_badge_display_show_boot_status(0);
+      blind_badge_menu_show();
     }
 }
 
+/* PLAY: single click enters the service page of the selected entry and
+ * starts its preset task.  Double click stops that task and returns to the
+ * menu list.
+ */
+
+static void handle_play_short_press(void)
+{
+  (void)blind_badge_menu_enter();
+}
+
+static void handle_play_double_press(void)
+{
+  (void)blind_badge_menu_leave();
+}
+
 #ifdef CONFIG_ADC
-static int read_dn_button(int fd, bool *pressed)
+static int read_adc_millivolts(int fd, int *millivolts)
 {
   struct adc_msg_s sample;
   ssize_t nread;
@@ -1719,10 +1751,13 @@ static int read_dn_button(int fd, bool *pressed)
       return nread < 0 ? -errno : -EIO;
     }
 
-  *pressed = sample.am_channel == 0 &&
-             sample.am_data >= BLIND_BADGE_BUTTON_DN_MIN_MV &&
-             sample.am_data <= BLIND_BADGE_BUTTON_DN_MAX_MV;
+  *millivolts = sample.am_channel == 0 ? (int)sample.am_data : -1;
   return 0;
+}
+
+static bool adc_in_band(int millivolts, int low, int high)
+{
+  return millivolts >= low && millivolts <= high;
 }
 #endif
 
@@ -1781,6 +1816,7 @@ static int handle_button_service(int argc)
   int pending_clicks = 0;
   uint64_t press_started_ms = 0;
   uint64_t click_deadline_ms = 0;
+  uint64_t menu_refresh_ms = 0;
   int fd;
 #ifdef CONFIG_ADC
   bool dn_pressed = false;
@@ -1788,6 +1824,14 @@ static int handle_button_service(int argc)
   int dn_stable_samples = 0;
   int dn_pending_clicks = 0;
   uint64_t dn_click_deadline_ms = 0;
+  bool menu_pressed = false;
+  bool menu_candidate = false;
+  int menu_stable_samples = 0;
+  bool play_pressed = false;
+  bool play_candidate = false;
+  int play_stable_samples = 0;
+  int play_pending_clicks = 0;
+  uint64_t play_click_deadline_ms = 0;
   int adc_fd = -1;
 #endif
 
@@ -1824,6 +1868,7 @@ static int handle_button_service(int argc)
 #endif
 
   g_button_service_running = 1;
+  blind_badge_menu_show();
 
   while (g_button_service_running)
     {
@@ -1883,11 +1928,24 @@ static int handle_button_service(int argc)
       if (adc_fd >= 0)
         {
           bool dn_raw_pressed = false;
+          bool menu_raw_pressed = false;
+          bool play_raw_pressed = false;
+          int millivolts = -1;
           int adc_ret;
 
-          adc_ret = read_dn_button(adc_fd, &dn_raw_pressed);
+          adc_ret = read_adc_millivolts(adc_fd, &millivolts);
           if (adc_ret == 0)
             {
+              dn_raw_pressed =
+                adc_in_band(millivolts, BLIND_BADGE_BUTTON_DN_MIN_MV,
+                            BLIND_BADGE_BUTTON_DN_MAX_MV);
+              menu_raw_pressed =
+                adc_in_band(millivolts, BLIND_BADGE_BUTTON_MENU_MIN_MV,
+                            BLIND_BADGE_BUTTON_MENU_MAX_MV);
+              play_raw_pressed =
+                adc_in_band(millivolts, BLIND_BADGE_BUTTON_PLAY_MIN_MV,
+                            BLIND_BADGE_BUTTON_PLAY_MAX_MV);
+
               if (dn_raw_pressed == dn_candidate)
                 {
                   if (dn_stable_samples <
@@ -1922,6 +1980,66 @@ static int handle_button_service(int argc)
                         }
                     }
                 }
+
+              if (menu_raw_pressed == menu_candidate)
+                {
+                  if (menu_stable_samples <
+                      BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES)
+                    {
+                      menu_stable_samples++;
+                    }
+                }
+              else
+                {
+                  menu_candidate = menu_raw_pressed;
+                  menu_stable_samples = 1;
+                }
+
+              if (menu_stable_samples >=
+                  BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES &&
+                  menu_candidate != menu_pressed)
+                {
+                  menu_pressed = menu_candidate;
+                  if (!menu_pressed)
+                    {
+                      blind_badge_menu_next();
+                    }
+                }
+
+              if (play_raw_pressed == play_candidate)
+                {
+                  if (play_stable_samples <
+                      BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES)
+                    {
+                      play_stable_samples++;
+                    }
+                }
+              else
+                {
+                  play_candidate = play_raw_pressed;
+                  play_stable_samples = 1;
+                }
+
+              if (play_stable_samples >=
+                  BLIND_BADGE_BUTTON_ADC_DEBOUNCE_SAMPLES &&
+                  play_candidate != play_pressed)
+                {
+                  play_pressed = play_candidate;
+                  if (!play_pressed)
+                    {
+                      play_pending_clicks++;
+                      if (play_pending_clicks >= 2)
+                        {
+                          play_pending_clicks = 0;
+                          handle_play_double_press();
+                        }
+                      else
+                        {
+                          play_click_deadline_ms =
+                            now_ms + BLIND_BADGE_BUTTON_PLAY_DOUBLE_MS;
+                        }
+                    }
+                }
             }
         }
 
@@ -1931,7 +2049,24 @@ static int handle_button_service(int argc)
           dn_pending_clicks = 0;
           handle_dn_short_press();
         }
+
+      if (!play_pressed && play_pending_clicks == 1 &&
+          now_ms >= play_click_deadline_ms)
+        {
+          play_pending_clicks = 0;
+          handle_play_short_press();
+        }
 #endif
+
+      /* refresh() is cached: this only redraws once when STARTING changes
+       * to RUNNING/ERROR, then costs no framebuffer work while streaming.
+       */
+
+      if (now_ms >= menu_refresh_ms)
+        {
+          blind_badge_menu_refresh();
+          menu_refresh_ms = now_ms + 250;
+        }
 
       usleep(BLIND_BADGE_BUTTON_POLL_MS * 1000);
     }
@@ -2240,6 +2375,49 @@ int main(int argc, char *argv[])
              g_button_service_running ? "RUNNING" : "STOPPED");
       printf("[BlindBadge] state.current: %s\n",
              blind_badge_state_name(blind_badge_state_get()));
+      return 0;
+    }
+
+  if (strcmp(argv[1], "menu_show") == 0)
+    {
+      return blind_badge_menu_show() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "menu_next") == 0)
+    {
+      return blind_badge_menu_next() == 0 ? 0 : 1;
+    }
+
+  if (strcmp(argv[1], "menu_status") == 0)
+    {
+      printf("[BlindBadge] menu.selected=%d page=%s\n",
+             (int)blind_badge_menu_selected(),
+             blind_badge_menu_is_service_page() ? "service" : "list");
+      return 0;
+    }
+
+  if (strcmp(argv[1], "play") == 0)
+    {
+      handle_play_short_press();
+      return 0;
+    }
+
+  if (strcmp(argv[1], "back") == 0)
+    {
+      handle_play_double_press();
+      return 0;
+    }
+
+  if (strcmp(argv[1], "service_status") == 0)
+    {
+      char detail[64];
+      enum blind_badge_menu_id id = blind_badge_service_active();
+
+      blind_badge_service_detail(detail, sizeof(detail));
+      printf("[BlindBadge] service: %s state=%s detail=%s\n",
+             blind_badge_service_label(id),
+             blind_badge_service_state_name(blind_badge_service_state()),
+             detail);
       return 0;
     }
 

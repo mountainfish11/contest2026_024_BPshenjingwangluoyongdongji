@@ -23,6 +23,14 @@
 #define UART_LINK_CONTROL_PATH   "/var/mqueue/blind_badge_link"
 #define UART_LINK_FLAG_SIZE      32
 
+/* The UART link must keep working when no USB serial reader is attached.
+ * Printing from this network thread can fill the CDC TX buffer and block the
+ * protocol after only a few menu changes.  Keep runtime tracing disabled;
+ * explicit NSH status commands remain available to the operator.
+ */
+
+#define UART_LINK_LOG(...) do { } while (0)
+
 static pthread_t g_thread;
 static volatile int g_running;
 static volatile int g_connected;
@@ -32,6 +40,18 @@ static unsigned int g_tx_seq;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
 static uart_link_event_handler_t g_event_handler;
 static void *g_event_handler_arg;
+
+static time_t monotonic_seconds(void)
+{
+  struct timespec now;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    {
+      return 0;
+    }
+
+  return now.tv_sec;
+}
 
 static int valid_flag(const char *flag, size_t *flag_len)
 {
@@ -125,8 +145,8 @@ static int send_flag_to_client(const char *flag)
           ret = send_all(g_client_fd, frame, (size_t)n);
           if (ret == 0)
             {
-              printf("[UART_LINK] command sent: seq=%u flag=%s\n", seq,
-                     flag);
+              UART_LINK_LOG("[UART_LINK] command sent: seq=%u flag=%s\n",
+                            seq, flag);
             }
         }
     }
@@ -154,14 +174,14 @@ static int handle_line(const char *line)
   token = strtok_r(frame, " ", &saveptr);
   if (token == NULL || strcmp(token, "UART_LINK/1") != 0)
     {
-      printf("[UART_LINK] rejected malformed frame: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed frame: %s\n", line);
       return 0;
     }
 
   token = strtok_r(NULL, " ", &saveptr);
   if (token == NULL || strlen(token) >= sizeof(type))
     {
-      printf("[UART_LINK] rejected malformed frame: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed frame: %s\n", line);
       return 0;
     }
   strcpy(type, token);
@@ -169,26 +189,26 @@ static int handle_line(const char *line)
   token = strtok_r(NULL, " ", &saveptr);
   if (token == NULL)
     {
-      printf("[UART_LINK] rejected malformed frame: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed frame: %s\n", line);
       return 0;
     }
   seq = (unsigned int)strtoul(token, &end, 10);
   if (*token == '\0' || *end != '\0')
     {
-      printf("[UART_LINK] rejected malformed sequence: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed sequence: %s\n", line);
       return 0;
     }
 
   token = strtok_r(NULL, " ", &saveptr);
   if (token == NULL)
     {
-      printf("[UART_LINK] rejected malformed frame: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed frame: %s\n", line);
       return 0;
     }
   len = (unsigned int)strtoul(token, &end, 10);
   if (*token == '\0' || *end != '\0')
     {
-      printf("[UART_LINK] rejected malformed length: %s\n", line);
+      UART_LINK_LOG("[UART_LINK] rejected malformed length: %s\n", line);
       return 0;
     }
 
@@ -201,16 +221,16 @@ static int handle_line(const char *line)
 
   if (len > UART_LINK_LINE_SIZE - 1)
     {
-      printf("[UART_LINK] rejected oversized frame: type=%s len=%u\n",
-             type, len);
+      UART_LINK_LOG("[UART_LINK] rejected oversized frame: type=%s len=%u\n",
+                    type, len);
       return 0;
     }
 
   if (strlen(payload) != len)
     {
-      printf("[UART_LINK] rejected length mismatch: type=%s declared=%u "
-             "actual=%u payload=%s\n", type, len,
-             (unsigned int)strlen(payload), payload);
+      UART_LINK_LOG("[UART_LINK] rejected length mismatch: type=%s "
+                    "declared=%u actual=%u payload=%s\n", type, len,
+                    (unsigned int)strlen(payload), payload);
       return 0;
     }
 
@@ -219,7 +239,8 @@ static int handle_line(const char *line)
       char ack[96];
       int n = snprintf(ack, sizeof(ack),
                        "UART_LINK/1 HELLO_ACK %u 2 OK\n", seq);
-      printf("[UART_LINK] RX type=HELLO seq=%u payload=%s\n", seq, payload);
+      UART_LINK_LOG("[UART_LINK] RX type=HELLO seq=%u payload=%s\n", seq,
+                    payload);
       return send_client_data(ack, (size_t)n);
     }
   else if (strcmp(type, "PING") == 0)
@@ -235,7 +256,7 @@ static int handle_line(const char *line)
         {
           return 0;
         }
-      printf("[UART_LINK] command acknowledged: seq=%u\n", seq);
+      UART_LINK_LOG("[UART_LINK] command acknowledged: seq=%u\n", seq);
       return 0;
     }
 
@@ -285,7 +306,8 @@ static int handle_line(const char *line)
       }
   }
 
-  printf("[UART_LINK] RX type=%s seq=%u payload=%s\n", type, seq, payload);
+  UART_LINK_LOG("[UART_LINK] RX type=%s seq=%u payload=%s\n", type, seq,
+                payload);
   if (g_event_handler != NULL)
     {
       g_event_handler(&event, g_event_handler_arg);
@@ -320,12 +342,14 @@ static void *uart_link_thread(void *arg)
                        O_RDONLY | O_CREAT | O_NONBLOCK, 0666, &mq_attr);
   if (control_mq == (mqd_t)-1)
     {
-      printf("[UART_LINK] control queue create failed: errno=%d\n", errno);
+      UART_LINK_LOG("[UART_LINK] control queue create failed: errno=%d\n",
+                    errno);
       goto done;
     }
   if (chmod(UART_LINK_CONTROL_PATH, 0666) != 0)
     {
-      printf("[UART_LINK] control queue chmod failed: errno=%d\n", errno);
+      UART_LINK_LOG("[UART_LINK] control queue chmod failed: errno=%d\n",
+                    errno);
     }
 
   int yes = 1;
@@ -363,7 +387,7 @@ static void *uart_link_thread(void *arg)
         }
 
       if (g_client_fd >= 0 &&
-          time(NULL) - last_activity > UART_LINK_IDLE_TIMEOUT_S)
+          monotonic_seconds() - last_activity > UART_LINK_IDLE_TIMEOUT_S)
         {
           close_client();
           used = 0;
@@ -384,8 +408,8 @@ static void *uart_link_thread(void *arg)
           flag[n] = '\0';
           if (send_flag_to_client(flag) != 0)
             {
-              printf("[UART_LINK] command dropped: disconnected flag=%s\n",
-                     flag);
+              UART_LINK_LOG("[UART_LINK] command dropped: disconnected "
+                            "flag=%s\n", flag);
             }
         }
 
@@ -428,8 +452,8 @@ static void *uart_link_thread(void *arg)
               g_connected = 1;
               pthread_mutex_unlock(&g_client_lock);
               used = 0;
-              last_activity = time(NULL);
-              printf("[UART_LINK] TCP peer connected\n");
+              last_activity = monotonic_seconds();
+              UART_LINK_LOG("[UART_LINK] TCP peer connected\n");
             }
         }
 
@@ -453,7 +477,7 @@ static void *uart_link_thread(void *arg)
             }
           else
             {
-              last_activity = time(NULL);
+              last_activity = monotonic_seconds();
               memcpy(buffer + used, chunk, (size_t)n);
               used += (size_t)n;
               buffer[used] = '\0';
@@ -548,14 +572,16 @@ int UART_LINK_SendFlag(const char *flag)
   mq = mq_open(UART_LINK_CONTROL_QUEUE, O_WRONLY | O_NONBLOCK);
   if (mq == (mqd_t)-1)
     {
-      printf("[UART_LINK] control queue open failed: errno=%d\n", errno);
+      UART_LINK_LOG("[UART_LINK] control queue open failed: errno=%d\n",
+                    errno);
       return -1;
     }
 
   ret = mq_send(mq, flag, flag_len, 0);
   if (ret != 0)
     {
-      printf("[UART_LINK] control queue send failed: errno=%d\n", errno);
+      UART_LINK_LOG("[UART_LINK] control queue send failed: errno=%d\n",
+                    errno);
     }
   mq_close(mq);
   return ret == 0 ? 0 : -1;

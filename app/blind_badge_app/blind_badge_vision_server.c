@@ -56,7 +56,6 @@
 #define VISION_HTTP_SEND_CHUNK 1400
 #define VISION_HTTP_SEND_DELAY_US 1000
 #define VISION_STREAM_STACK_SIZE 8192
-#define VISION_STREAM_PRIORITY 254
 #define VISION_CLIENT_DETACHED 1
 #define VISION_FRAME_TIMEOUT_MS 1500
 #define VISION_FRAME_RETRY_US 10000
@@ -93,6 +92,7 @@ static int g_listen_fd = -1;
 static int g_stream_fd = -1;
 static struct vision_camera_s g_server_camera;
 static bool g_server_camera_ready;
+static bool g_server_camera_preparing;
 static bool g_stream_active;
 static int g_server_port = VISION_HTTP_DEFAULT_PORT;
 static unsigned long g_frames;
@@ -106,6 +106,20 @@ static char g_network_addr[INET_ADDRSTRLEN] = "0.0.0.0";
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+static int vision_runtime_log(const char *format, ...)
+{
+  (void)format;
+  return 0;
+}
+
+/* The HTTP/camera worker runs without a USB console reader in normal use.
+ * Its historical printf tracing can fill the CDC TX buffer and stop camera
+ * startup or streaming.  Silence only this file's background path; explicit
+ * status and test commands below remain printable after the undef.
+ */
+
+#define printf vision_runtime_log
 
 static uint64_t vision_monotonic_us(void);
 
@@ -792,8 +806,6 @@ static void *vision_stream_worker(void *arg)
   int fd = (int)(intptr_t)arg;
   int ret;
 
-  pthread_setschedprio(pthread_self(), VISION_STREAM_PRIORITY);
-
   ret = vision_handle_stream(fd);
   shutdown(fd, SHUT_RDWR);
   close(fd);
@@ -997,11 +1009,63 @@ static int vision_handle_client(int fd)
  * Public Functions
  ****************************************************************************/
 
+int blind_badge_vision_server_prepare(void)
+{
+  struct v4l2_buffer warmup_buffer;
+  int ret;
+
+  pthread_mutex_lock(&g_server_lock);
+  if (g_server_camera_ready)
+    {
+      pthread_mutex_unlock(&g_server_lock);
+      return OK;
+    }
+
+  if (g_server_camera_preparing)
+    {
+      pthread_mutex_unlock(&g_server_lock);
+      return -EBUSY;
+    }
+
+  g_server_camera_preparing = true;
+  pthread_mutex_unlock(&g_server_lock);
+
+  ret = vision_camera_open(&g_server_camera);
+  if (ret == OK)
+    {
+      ret = vision_camera_start(&g_server_camera);
+    }
+
+  if (ret == OK)
+    {
+      ret = vision_camera_capture(&g_server_camera, &warmup_buffer, false);
+    }
+
+  if (ret == OK)
+    {
+      ret = vision_camera_release(&g_server_camera, &warmup_buffer);
+    }
+
+  if (ret < 0)
+    {
+      vision_camera_close(&g_server_camera);
+    }
+
+  pthread_mutex_lock(&g_server_lock);
+  g_server_camera_ready = ret == OK;
+  g_server_camera_preparing = false;
+  g_last_error = ret;
+  pthread_mutex_unlock(&g_server_lock);
+
+  printf("[BlindBadge] vision_server: camera prepare %s (%d)\n",
+         ret == OK ? "OK" : "failed", ret);
+  return ret;
+}
+
 int blind_badge_vision_server_run(int port)
 {
   struct sockaddr_in address;
   struct pollfd pollfd;
-  struct v4l2_buffer warmup_buffer;
   int reuse = 1;
   int client;
   int ret;
@@ -1026,14 +1090,11 @@ int blind_badge_vision_server_run(int port)
   g_stream_active = false;
   pthread_mutex_unlock(&g_server_lock);
 
-  /* Initialize the camera once before exposing the network server.  Reusing
-   * one V4L2
-   * session avoids repeating sensor, DMA, and STREAMON/STREAMOFF setup in
-   * the request path, matching the persistent-camera strategy used by the
-   * reference delivery.
+  /* The board normally prepares and retains the camera during bring-up.
+   * Keep this fallback for manual starts on builds without that hook.
    */
 
-  ret = vision_camera_open(&g_server_camera);
+  ret = blind_badge_vision_server_prepare();
   if (ret < 0)
     {
       printf("[BlindBadge] vision_server: persistent camera open failed "
@@ -1041,7 +1102,6 @@ int blind_badge_vision_server_run(int port)
       goto finished;
     }
 
-  g_server_camera_ready = true;
   printf("[BlindBadge] vision_server: camera mode=persistent fd=%d\n",
          g_server_camera.fd);
 
@@ -1057,30 +1117,7 @@ int blind_badge_vision_server_run(int port)
     }
 #endif
 
-  /* Prime the sensor and keep the V4L2 ring running for the server lifetime.
-   * Repeated STREAMON/STREAMOFF transitions proved less reliable than
-   * continuously replacing old frames in ring mode.
-   */
-
-  ret = vision_camera_start(&g_server_camera);
-  if (ret == OK)
-    {
-      ret = vision_camera_capture(&g_server_camera, &warmup_buffer, false);
-    }
-
-  if (ret == OK)
-    {
-      ret = vision_camera_release(&g_server_camera, &warmup_buffer);
-    }
-
-  if (ret < 0)
-    {
-      printf("[BlindBadge] vision_server: camera warmup failed (%d)\n",
-             ret);
-      goto finished;
-    }
-
-  printf("[BlindBadge] vision_server: camera warmup complete\n");
+  printf("[BlindBadge] vision_server: camera already prepared\n");
 
 #ifdef CONFIG_ESP32S3_WIFI_SOFTAP
   ret = vision_network_start();
@@ -1186,12 +1223,6 @@ finished:
       g_listen_fd = -1;
     }
 
-  if (g_server_camera_ready)
-    {
-      vision_camera_close(&g_server_camera);
-      g_server_camera_ready = false;
-    }
-
   vision_network_stop();
 
   pthread_mutex_lock(&g_server_lock);
@@ -1226,6 +1257,8 @@ int blind_badge_vision_server_stop(void)
   return OK;
 }
 
+#undef printf
+
 int blind_badge_vision_server_status(void)
 {
   pthread_mutex_lock(&g_server_lock);
@@ -1240,6 +1273,28 @@ int blind_badge_vision_server_status(void)
          g_network_addr, g_server_port,
          g_stream_active ? "ACTIVE" : "IDLE",
          g_clients, g_frames, g_last_error);
+  pthread_mutex_unlock(&g_server_lock);
+  return OK;
+}
+
+int blind_badge_vision_server_snapshot(
+  struct blind_badge_vision_server_snapshot *snapshot)
+{
+  if (snapshot == NULL)
+    {
+      return -EINVAL;
+    }
+
+  pthread_mutex_lock(&g_server_lock);
+  snapshot->running = g_server_running;
+  snapshot->camera_ready = g_server_camera_ready;
+  snapshot->listening = g_listen_fd >= 0;
+  snapshot->stream_active = g_stream_active;
+  snapshot->port = g_server_port;
+  snapshot->last_error = g_last_error;
+  snapshot->frames = g_frames;
+  strlcpy(snapshot->address, g_network_addr,
+          sizeof(snapshot->address));
   pthread_mutex_unlock(&g_server_lock);
   return OK;
 }

@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -497,8 +498,9 @@ static void fill_rect(struct blind_badge_fb *fb, int x, int y, int w, int h,
     }
 }
 
-static void draw_char(struct blind_badge_fb *fb, int x, int y, char ch,
-                      uint8_t r, uint8_t g, uint8_t b)
+static void draw_char_scaled(struct blind_badge_fb *fb, int x, int y,
+                             char ch, int scale,
+                             uint8_t r, uint8_t g, uint8_t b)
 {
   const uint8_t *glyph = font5x7(ch);
   int row;
@@ -512,19 +514,124 @@ static void draw_char(struct blind_badge_fb *fb, int x, int y, char ch,
         {
           if ((glyph[row] & (1 << (BLIND_BADGE_FONT_W - 1 - col))) != 0)
             {
-              for (sy = 0; sy < BLIND_BADGE_TEXT_SCALE; sy++)
+              for (sy = 0; sy < scale; sy++)
                 {
-                  for (sx = 0; sx < BLIND_BADGE_TEXT_SCALE; sx++)
+                  for (sx = 0; sx < scale; sx++)
                     {
-                      put_pixel(fb,
-                                x + col * BLIND_BADGE_TEXT_SCALE + sx,
-                                y + row * BLIND_BADGE_TEXT_SCALE + sy,
-                                r, g, b);
+                      put_pixel(fb, x + col * scale + sx,
+                                y + row * scale + sy, r, g, b);
                     }
                 }
             }
         }
     }
+}
+
+static int ascii_text_width(const char *text, int scale)
+{
+  size_t length = text != NULL ? strlen(text) : 0;
+
+  if (length == 0)
+    {
+      return 0;
+    }
+
+  return (int)length * (BLIND_BADGE_FONT_W + 1) * scale - scale;
+}
+
+static void draw_ascii_text_centered(struct blind_badge_fb *fb, int center_x,
+                                     int y, const char *text, int scale,
+                                     uint8_t r, uint8_t g, uint8_t b)
+{
+  int x = center_x - ascii_text_width(text, scale) / 2;
+
+  while (text != NULL && *text != '\0')
+    {
+      draw_char_scaled(fb, x, y, *text, scale, r, g, b);
+      x += (BLIND_BADGE_FONT_W + 1) * scale;
+      text++;
+    }
+}
+
+static const uint8_t g_menu_camera_icon[8] =
+{
+  0x00, 0x18, 0x7e, 0xff, 0xc3, 0xc3, 0xff, 0x7e
+};
+
+static const uint8_t g_menu_microphone_icon[8] =
+{
+  0x18, 0x3c, 0x3c, 0x3c, 0x5a, 0x66, 0x18, 0x3c
+};
+
+static const uint8_t g_menu_heart_icon[8] =
+{
+  0x00, 0x66, 0xff, 0xff, 0x7e, 0x3c, 0x18, 0x00
+};
+
+static const uint8_t g_menu_bell_icon[8] =
+{
+  0x18, 0x3c, 0x3c, 0x7e, 0x7e, 0xff, 0x18, 0x18
+};
+
+static const uint8_t g_menu_settings_icon[8] =
+{
+  0x18, 0x5a, 0x7e, 0xe7, 0xe7, 0x7e, 0x5a, 0x18
+};
+
+static const uint8_t *menu_icon_bitmap(enum blind_badge_menu_icon icon)
+{
+  switch (icon)
+    {
+      case BLIND_BADGE_MENU_ICON_CAMERA:
+        return g_menu_camera_icon;
+      case BLIND_BADGE_MENU_ICON_MICROPHONE:
+        return g_menu_microphone_icon;
+      case BLIND_BADGE_MENU_ICON_HEART:
+        return g_menu_heart_icon;
+      case BLIND_BADGE_MENU_ICON_BELL:
+        return g_menu_bell_icon;
+      case BLIND_BADGE_MENU_ICON_SETTINGS:
+      default:
+        return g_menu_settings_icon;
+    }
+}
+
+static void draw_menu_icon(struct blind_badge_fb *fb,
+                           enum blind_badge_menu_icon icon,
+                           int center_x, int y, int size,
+                           uint8_t r, uint8_t g, uint8_t b)
+{
+  const uint8_t *bitmap = menu_icon_bitmap(icon);
+  int scale = size / 8;
+  int actual_size;
+  int x;
+  int row;
+  int col;
+
+  if (scale < 1)
+    {
+      scale = 1;
+    }
+
+  actual_size = scale * 8;
+  x = center_x - actual_size / 2;
+  for (row = 0; row < 8; row++)
+    {
+      for (col = 0; col < 8; col++)
+        {
+          if ((bitmap[row] & (1 << (7 - col))) != 0)
+            {
+              fill_rect(fb, x + col * scale, y + row * scale,
+                        scale, scale, r, g, b);
+            }
+        }
+    }
+}
+
+static void draw_char(struct blind_badge_fb *fb, int x, int y, char ch,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+  draw_char_scaled(fb, x, y, ch, BLIND_BADGE_TEXT_SCALE, r, g, b);
 }
 
 static void draw_cjk_char(struct blind_badge_fb *fb, int x, int y,
@@ -812,6 +919,267 @@ int blind_badge_display_show_lines(const char *line0,
 #endif
   return display_show_lines_with_wifi(line0, line1, line2, line3,
                                       connected);
+}
+
+#ifdef CONFIG_VIDEO_FB
+static void draw_menu_focus_frame(struct blind_badge_fb *fb,
+                                  int x, int y, int w, int h)
+{
+  uint8_t r = 32;
+  uint8_t g = 205;
+  uint8_t b = 255;
+
+  fill_rect(fb, x + 12, y, w - 24, 2, r, g, b);
+  fill_rect(fb, x + 12, y + h - 2, w - 24, 2, r, g, b);
+  fill_rect(fb, x, y + 12, 2, h - 24, r, g, b);
+  fill_rect(fb, x + w - 2, y + 12, 2, h - 24, r, g, b);
+  fill_rect(fb, x + 6, y + 2, 8, 2, r, g, b);
+  fill_rect(fb, x + 2, y + 6, 6, 2, r, g, b);
+  fill_rect(fb, x + w - 14, y + 2, 8, 2, r, g, b);
+  fill_rect(fb, x + w - 8, y + 6, 6, 2, r, g, b);
+  fill_rect(fb, x + 6, y + h - 4, 8, 2, r, g, b);
+  fill_rect(fb, x + 2, y + h - 8, 6, 2, r, g, b);
+  fill_rect(fb, x + w - 14, y + h - 4, 8, 2, r, g, b);
+  fill_rect(fb, x + w - 8, y + h - 8, 6, 2, r, g, b);
+}
+
+static int display_show_menu_position(
+  const char *const labels[],
+  const enum blind_badge_menu_icon icons[],
+  size_t item_count, size_t selected, int scroll_pixels,
+  bool wifi_connected)
+{
+  struct blind_badge_fb fb;
+  const int center_y = 112;
+  const int row_spacing = 64;
+  int offset;
+  int ret;
+
+  if (labels == NULL || icons == NULL || item_count == 0 ||
+      selected >= item_count)
+    {
+      return -EINVAL;
+    }
+
+  ret = fb_open(&fb);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  fill_rect(&fb, 0, 0, fb.vinfo.xres, fb.vinfo.yres, 0, 0, 0);
+  if (wifi_connected)
+    {
+      draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 8,
+                               "WIFI OK", 1, 40, 220, 100);
+    }
+
+  for (offset = -2; offset <= 3; offset++)
+    {
+      int item = (int)selected + offset;
+      int y = center_y + offset * row_spacing - scroll_pixels;
+      int distance = y - center_y;
+      int icon_size;
+      int label_y;
+      int label_scale;
+      uint8_t intensity;
+
+      if (distance < 0)
+        {
+          distance = -distance;
+        }
+
+      if (y < -24 || y > fb.vinfo.yres + 24)
+        {
+          continue;
+        }
+
+      while (item < 0)
+        {
+          item += (int)item_count;
+        }
+
+      item %= (int)item_count;
+      icon_size = 40 - distance * 16 / row_spacing;
+      if (icon_size < 16)
+        {
+          icon_size = 16;
+        }
+
+      if (distance >= row_spacing)
+        {
+          intensity = distance >= row_spacing * 2 ? 36 : 104;
+        }
+      else
+        {
+          intensity = 255 - distance * 151 / row_spacing;
+        }
+
+      label_scale = distance < 24 ? 2 : 1;
+      label_y = y - BLIND_BADGE_FONT_H * label_scale / 2;
+      draw_menu_icon(&fb, icons[item], 52, y - icon_size / 2, icon_size,
+                     intensity, intensity,
+                     distance < 24 ? 255 : intensity);
+      draw_ascii_text_centered(&fb, 145, label_y, labels[item],
+                               label_scale, intensity, intensity,
+                               distance < 24 ? 255 : intensity);
+    }
+
+  draw_menu_focus_frame(&fb, 12, center_y - 32,
+                        fb.vinfo.xres - 24, 64);
+  fill_rect(&fb, fb.vinfo.xres - 8, 44, 3, 136, 24, 42, 58);
+  if (item_count > 1)
+    {
+      int position = ((int)selected * 116) / ((int)item_count - 1);
+
+      fill_rect(&fb, fb.vinfo.xres - 9, 44 + position, 5, 20,
+                36, 210, 150);
+    }
+
+  update_screen(&fb);
+  fb_close(&fb);
+  return 0;
+}
+#endif
+
+int blind_badge_display_show_menu(
+  const char *const labels[],
+  const enum blind_badge_menu_icon icons[],
+  size_t item_count, size_t selected)
+{
+#ifdef CONFIG_VIDEO_FB
+  bool wifi_connected = false;
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  wifi_connected = network_is_connected();
+#endif
+  return display_show_menu_position(labels, icons, item_count, selected, 0,
+                                    wifi_connected);
+#else
+  (void)labels;
+  (void)icons;
+  (void)item_count;
+  (void)selected;
+  return -ENODEV;
+#endif
+}
+
+int blind_badge_display_animate_menu_next(
+  const char *const labels[],
+  const enum blind_badge_menu_icon icons[],
+  size_t item_count, size_t selected)
+{
+#ifdef CONFIG_VIDEO_FB
+  static const int g_scroll_steps[] = {24, 48};
+  bool wifi_connected = false;
+  size_t i;
+  int ret = 0;
+
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  wifi_connected = network_is_connected();
+#endif
+
+  for (i = 0; i < sizeof(g_scroll_steps) / sizeof(g_scroll_steps[0]); i++)
+    {
+      ret = display_show_menu_position(labels, icons, item_count,
+                                       selected, g_scroll_steps[i],
+                                       wifi_connected);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      usleep(18000);
+    }
+
+  return ret;
+#else
+  (void)labels;
+  (void)icons;
+  (void)item_count;
+  (void)selected;
+  return -ENODEV;
+#endif
+}
+
+/****************************************************************************
+ * Name: blind_badge_display_show_service
+ *
+ * Description:
+ *   Service page shown after a PLAY single click.  The state word owns the
+ *   colour so the operator can read the service state from across a table.
+ *
+ ****************************************************************************/
+
+int blind_badge_display_show_service(const char *title, const char *state,
+                                     const char *detail, const char *hint)
+{
+#ifdef CONFIG_VIDEO_FB
+  struct blind_badge_fb fb;
+  uint8_t r = 90;
+  uint8_t g = 120;
+  uint8_t b = 200;
+  int ret;
+
+  if (title == NULL || state == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (strcmp(state, "RUNNING") == 0)
+    {
+      r = 40; g = 210; b = 110;
+    }
+  else if (strcmp(state, "STARTING") == 0 ||
+           strcmp(state, "STOPPING") == 0)
+    {
+      r = 240; g = 180; b = 60;
+    }
+  else if (strcmp(state, "ERROR") == 0)
+    {
+      r = 230; g = 70; b = 70;
+    }
+  else if (strcmp(state, "NOT READY") == 0)
+    {
+      r = 130; g = 130; b = 130;
+    }
+
+  ret = fb_open(&fb);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  fill_rect(&fb, 0, 0, fb.vinfo.xres, fb.vinfo.yres, 0, 0, 0);
+  fill_rect(&fb, 0, 0, fb.vinfo.xres, 34, r / 4, g / 4, b / 4);
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 8, title, 2,
+                           255, 255, 255);
+
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 70, state, 3, r, g, b);
+  fill_rect(&fb, 40, 112, fb.vinfo.xres - 80, 2, r, g, b);
+
+  if (detail != NULL && detail[0] != '\0')
+    {
+      draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 138, detail, 1,
+                               205, 205, 205);
+    }
+
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 188,
+                           hint != NULL ? hint : "2x PLAY  BACK", 1,
+                           120, 120, 120);
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 212, "BlindBadge", 1,
+                           70, 70, 70);
+
+  update_screen(&fb);
+  fb_close(&fb);
+  return 0;
+#else
+  (void)title;
+  (void)state;
+  (void)detail;
+  (void)hint;
+  return -ENODEV;
+#endif
 }
 
 int blind_badge_display_show_boot_status(int connected)
