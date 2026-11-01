@@ -7,6 +7,7 @@
 #include "blind_badge_service.h"
 #include "uart_link.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -19,6 +20,13 @@ enum blind_badge_menu_page
 {
   BLIND_BADGE_MENU_PAGE_LIST = 0,
   BLIND_BADGE_MENU_PAGE_SERVICE
+};
+
+enum blind_badge_speech_mode
+{
+  BLIND_BADGE_SPEECH_MODE_MENU = 0,
+  BLIND_BADGE_SPEECH_MODE_VISION,
+  BLIND_BADGE_SPEECH_MODE_SILENT
 };
 
 struct blind_badge_menu_item
@@ -67,7 +75,8 @@ static size_t g_menu_selected;
 static enum blind_badge_menu_page g_menu_page;
 static bool g_menu_redraw_pending;
 static int g_menu_announced = -1;
-static bool g_menu_link_was_connected;
+static bool g_speech_link_was_connected;
+static int g_speech_mode_sent = -1;
 static char g_menu_cached_state[BLIND_BADGE_MENU_STATE_SIZE];
 static char g_menu_cached_detail[BLIND_BADGE_MENU_DETAIL_SIZE];
 
@@ -83,25 +92,54 @@ static void menu_build_arrays(const char *labels[],
     }
 }
 
-static void menu_announce_selected(void)
+static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
 {
+  static const char *const flags[] =
+  {
+    "SPEECH_MODE_MENU",
+    "SPEECH_MODE_VISION",
+    "SPEECH_MODE_SILENT"
+  };
   bool connected = UART_LINK_IsConnected();
 
   if (!connected)
     {
-      g_menu_link_was_connected = false;
-      return;
+      g_speech_link_was_connected = false;
+      g_speech_mode_sent = -1;
+      return -ENOTCONN;
     }
 
+  if (!g_speech_link_was_connected)
+    {
+      g_menu_announced = -1;
+      g_speech_mode_sent = -1;
+      g_speech_link_was_connected = true;
+    }
+
+  if (g_speech_mode_sent == (int)mode)
+    {
+      return 0;
+    }
+
+  if (UART_LINK_SendFlag(flags[mode]) != 0)
+    {
+      return -EIO;
+    }
+
+  g_speech_mode_sent = (int)mode;
+  return 0;
+}
+
+static void menu_announce_selected(void)
+{
   /* Announce the current item once after every link establishment and once
    * after every real selection change.  LCD animation frames and ordinary
    * redraws must not enqueue duplicate speech.
    */
 
-  if (!g_menu_link_was_connected)
+  if (menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_MENU) < 0)
     {
-      g_menu_announced = -1;
-      g_menu_link_was_connected = true;
+      return;
     }
 
   if (g_menu_announced == (int)g_menu_selected)
@@ -121,6 +159,10 @@ static int render_service_page(void)
   enum blind_badge_service_state state = blind_badge_service_state();
   const char *name = blind_badge_service_state_name(state);
   char detail[BLIND_BADGE_MENU_DETAIL_SIZE];
+
+  (void)menu_sync_speech_mode(
+    id == BLIND_BADGE_MENU_VISION ?
+    BLIND_BADGE_SPEECH_MODE_VISION : BLIND_BADGE_SPEECH_MODE_SILENT);
 
   blind_badge_service_detail(detail, sizeof(detail));
 
@@ -144,6 +186,11 @@ int blind_badge_menu_show(void)
     icons[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
   int ret;
 
+  if (blind_badge_service_state() == BLIND_BADGE_SERVICE_STOPPING)
+    {
+      return -EBUSY;
+    }
+
   menu_build_arrays(labels, icons);
   g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
   g_menu_redraw_pending = false;
@@ -162,6 +209,11 @@ int blind_badge_menu_next(void)
   enum blind_badge_menu_icon
     icons[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
   int ret;
+
+  if (blind_badge_service_state() == BLIND_BADGE_SERVICE_STOPPING)
+    {
+      return -EBUSY;
+    }
 
   /* While a service page is up the menu selection is locked; only the
    * PLAY double click leaves the page.
@@ -195,9 +247,28 @@ enum blind_badge_menu_id blind_badge_menu_selected(void)
 
 int blind_badge_menu_enter(void)
 {
+  enum blind_badge_menu_id selected;
+  int ret;
+
   if (g_menu_page == BLIND_BADGE_MENU_PAGE_SERVICE)
     {
       return blind_badge_menu_refresh();
+    }
+
+  if (blind_badge_service_state() != BLIND_BADGE_SERVICE_IDLE)
+    {
+      return -EBUSY;
+    }
+
+  selected = blind_badge_menu_selected();
+  (void)menu_sync_speech_mode(
+    selected == BLIND_BADGE_MENU_VISION ?
+    BLIND_BADGE_SPEECH_MODE_VISION : BLIND_BADGE_SPEECH_MODE_SILENT);
+
+  ret = blind_badge_service_start(selected);
+  if (ret == -EBUSY)
+    {
+      return ret;
     }
 
   g_menu_page = BLIND_BADGE_MENU_PAGE_SERVICE;
@@ -207,8 +278,6 @@ int blind_badge_menu_enter(void)
   /* Keep the page visible even when the service refuses to start so the
    * operator can read the reason and leave with a PLAY double click.
    */
-
-  (void)blind_badge_service_start(blind_badge_menu_selected());
 
   return render_service_page();
 }
