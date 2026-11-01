@@ -4,6 +4,7 @@
 
 #include "blind_badge_service.h"
 #include "blind_badge_vision_server.h"
+#include "uart_link.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -32,6 +33,7 @@ static enum blind_badge_menu_id g_service_active = BLIND_BADGE_MENU_VISION;
 static bool g_vision_thread_active;
 static bool g_vision_cancel_requested;
 static int g_vision_result;
+static int g_alert_result;
 
 static bool service_id_valid(enum blind_badge_menu_id id)
 {
@@ -115,6 +117,21 @@ static int vision_service_start(void)
   return 0;
 }
 
+static int alert_service_start(void)
+{
+  if (!UART_LINK_IsConnected())
+    {
+      return -ENOTCONN;
+    }
+
+  if (UART_LINK_SendFlag("EMERGENCY_SEND") != 0)
+    {
+      return -EIO;
+    }
+
+  return 0;
+}
+
 int blind_badge_service_start(enum blind_badge_menu_id id)
 {
   if (!service_id_valid(id))
@@ -139,6 +156,19 @@ int blind_badge_service_start(enum blind_badge_menu_id id)
           pthread_mutex_unlock(&g_service_lock);
           return g_vision_result;
         }
+    }
+  else if (id == BLIND_BADGE_MENU_ALERT)
+    {
+      g_service_state = BLIND_BADGE_SERVICE_STARTING;
+      g_alert_result = alert_service_start();
+      if (g_alert_result < 0)
+        {
+          g_service_state = BLIND_BADGE_SERVICE_ERROR;
+          pthread_mutex_unlock(&g_service_lock);
+          return g_alert_result;
+        }
+
+      g_service_state = BLIND_BADGE_SERVICE_RUNNING;
     }
   else
     {
@@ -274,6 +304,7 @@ int blind_badge_service_detail(char *buf, size_t size)
   enum blind_badge_menu_id active;
   struct blind_badge_vision_server_snapshot snapshot;
   int vision_result;
+  int alert_result;
 
   if (buf == NULL || size == 0)
     {
@@ -283,6 +314,7 @@ int blind_badge_service_detail(char *buf, size_t size)
   pthread_mutex_lock(&g_service_lock);
   active = g_service_active;
   vision_result = g_vision_result;
+  alert_result = g_alert_result;
   pthread_mutex_unlock(&g_service_lock);
 
   if (active == BLIND_BADGE_MENU_VISION &&
@@ -308,6 +340,24 @@ int blind_badge_service_detail(char *buf, size_t size)
       else
         {
           snprintf(buf, size, "starting vision");
+        }
+
+      return 0;
+    }
+
+  if (active == BLIND_BADGE_MENU_ALERT)
+    {
+      if (alert_result == -ENOTCONN)
+        {
+          snprintf(buf, size, "sub-board offline");
+        }
+      else if (alert_result < 0)
+        {
+          snprintf(buf, size, "alert failed: %d", alert_result);
+        }
+      else
+        {
+          snprintf(buf, size, "alert requested");
         }
 
       return 0;
