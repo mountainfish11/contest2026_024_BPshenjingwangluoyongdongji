@@ -31,6 +31,16 @@ int blind_badge_service_start(enum blind_badge_menu_id id);
 
 int blind_badge_service_stop(void);
 
+/* Deliver one recognized utterance from the sub-board to the active VOICE
+ * service.  Text received outside that service is deliberately ignored. */
+
+int blind_badge_service_submit_asr(const char *text);
+
+/* Complete an asynchronous VOICE stop after the sub-board confirms that its
+ * capture/ASR resources are idle. */
+
+void blind_badge_service_voice_idle(void);
+
 /* Effective state, derived from the service task itself. */
 
 enum blind_badge_service_state blind_badge_service_state(void);

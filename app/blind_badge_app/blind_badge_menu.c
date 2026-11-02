@@ -26,6 +26,8 @@ enum blind_badge_speech_mode
 {
   BLIND_BADGE_SPEECH_MODE_MENU = 0,
   BLIND_BADGE_SPEECH_MODE_VISION,
+  BLIND_BADGE_SPEECH_MODE_VOICE,
+  BLIND_BADGE_SPEECH_MODE_ALERT,
   BLIND_BADGE_SPEECH_MODE_SILENT
 };
 
@@ -98,6 +100,8 @@ static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
   {
     "SPEECH_MODE_MENU",
     "SPEECH_MODE_VISION",
+    "SPEECH_MODE_VOICE",
+    "SPEECH_MODE_ALERT",
     "SPEECH_MODE_SILENT"
   };
   bool connected = UART_LINK_IsConnected();
@@ -161,8 +165,10 @@ static int render_service_page(void)
   char detail[BLIND_BADGE_MENU_DETAIL_SIZE];
 
   (void)menu_sync_speech_mode(
-    id == BLIND_BADGE_MENU_VISION ?
-    BLIND_BADGE_SPEECH_MODE_VISION : BLIND_BADGE_SPEECH_MODE_SILENT);
+    id == BLIND_BADGE_MENU_VISION ? BLIND_BADGE_SPEECH_MODE_VISION :
+    id == BLIND_BADGE_MENU_VOICE ? BLIND_BADGE_SPEECH_MODE_VOICE :
+    id == BLIND_BADGE_MENU_ALERT ? BLIND_BADGE_SPEECH_MODE_ALERT :
+    BLIND_BADGE_SPEECH_MODE_SILENT);
 
   blind_badge_service_detail(detail, sizeof(detail));
 
@@ -262,8 +268,10 @@ int blind_badge_menu_enter(void)
 
   selected = blind_badge_menu_selected();
   (void)menu_sync_speech_mode(
-    selected == BLIND_BADGE_MENU_VISION ?
-    BLIND_BADGE_SPEECH_MODE_VISION : BLIND_BADGE_SPEECH_MODE_SILENT);
+    selected == BLIND_BADGE_MENU_VISION ? BLIND_BADGE_SPEECH_MODE_VISION :
+    selected == BLIND_BADGE_MENU_VOICE ? BLIND_BADGE_SPEECH_MODE_VOICE :
+    selected == BLIND_BADGE_MENU_ALERT ? BLIND_BADGE_SPEECH_MODE_ALERT :
+    BLIND_BADGE_SPEECH_MODE_SILENT);
 
   ret = blind_badge_service_start(selected);
   if (ret == -EBUSY)
@@ -284,22 +292,27 @@ int blind_badge_menu_enter(void)
 
 int blind_badge_menu_leave(void)
 {
+  const char *labels[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
+  enum blind_badge_menu_icon
+    icons[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
+
   if (g_menu_page == BLIND_BADGE_MENU_PAGE_SERVICE)
     {
       blind_badge_service_stop();
       g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
-      g_menu_redraw_pending = true;
+      g_menu_redraw_pending = false;
       g_menu_announced = -1;
 
-      /* Camera sensor initialization cannot be cancelled in the middle of
-       * an I2C transaction.  Defer the LCD transfer until that worker has
-       * released the camera/DMA resources.
+      /* Returning to the menu must never depend on a remote VOICE_IDLE
+       * packet.  Service cleanup may remain STOPPING in the background, but
+       * the operator gets the menu back immediately.  Starting another task
+       * is still rejected until cleanup reaches IDLE.
        */
-
-      if (blind_badge_service_state() == BLIND_BADGE_SERVICE_STOPPING)
-        {
-          return 0;
-        }
+      menu_build_arrays(labels, icons);
+      return blind_badge_display_show_menu(
+               labels, icons,
+               sizeof(g_menu_items) / sizeof(g_menu_items[0]),
+               g_menu_selected);
     }
 
   return blind_badge_menu_show();

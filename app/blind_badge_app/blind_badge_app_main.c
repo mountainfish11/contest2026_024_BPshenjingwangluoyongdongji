@@ -71,10 +71,7 @@
 #define BLIND_BADGE_VOICE_AI_PCM_FILE "/tmp/voice_ai_16bit.pcm"
 #define BLIND_BADGE_BUTTON_DEVICE "/dev/buttons"
 #define BLIND_BADGE_BUTTON_POLL_MS 20
-#define BLIND_BADGE_BUTTON_DOUBLE_MS 350
 #define BLIND_BADGE_BUTTON_DN_DOUBLE_MS 1200
-#define BLIND_BADGE_BUTTON_LONG_MS 1500
-#define BLIND_BADGE_BUTTON_VOICE_STACK_SIZE 16384
 #define BLIND_BADGE_BUTTON_WIFI_STACK_SIZE 8192
 #define BLIND_BADGE_BUTTON_ADC_DEVICE "/dev/adc0"
 #define BLIND_BADGE_BUTTON_DN_MIN_MV 900
@@ -1193,6 +1190,14 @@ static void handle_uart_link_event(const struct uart_link_event *link_event,
         event.severity = BLIND_BADGE_SEVERITY_EMERGENCY;
         break;
 
+      case UART_LINK_EVENT_ASR_RESULT:
+        (void)blind_badge_service_submit_asr(link_event->text);
+        return;
+
+      case UART_LINK_EVENT_VOICE_IDLE:
+        blind_badge_service_voice_idle();
+        return;
+
       default:
         return;
     }
@@ -1391,72 +1396,9 @@ static int handle_emergency(int argc,
 }
 
 static volatile int g_button_service_running;
-static pthread_mutex_t g_button_voice_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_button_voice_running;
 static pthread_mutex_t g_button_wifi_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_button_wifi_running;
 static bool g_wifi_sd_mounted;
-
-static void *button_voice_worker(void *arg)
-{
-  struct blind_badge_cli_options options =
-    {
-      .ai_mode = BLIND_BADGE_AI_OFF,
-#ifdef CONFIG_VIDEO_FB
-      .use_lcd = 1,
-#else
-      .use_lcd = 0,
-#endif
-      .option_count = 0
-    };
-  char *voice_argv[] = { "blind_badge_app", "voice_asr", "3", NULL };
-
-  (void)arg;
-  handle_voice_asr(3, voice_argv, &options);
-
-  pthread_mutex_lock(&g_button_voice_lock);
-  g_button_voice_running = 0;
-  pthread_mutex_unlock(&g_button_voice_lock);
-  return NULL;
-}
-
-static int start_button_voice_worker(void)
-{
-  pthread_attr_t attr;
-  pthread_t thread;
-  int ret;
-
-  pthread_mutex_lock(&g_button_voice_lock);
-  if (g_button_voice_running)
-    {
-      pthread_mutex_unlock(&g_button_voice_lock);
-      printf("[BlindBadge] button.voice: recognition already running\n");
-      return -EBUSY;
-    }
-
-  g_button_voice_running = 1;
-  pthread_mutex_unlock(&g_button_voice_lock);
-
-  blind_badge_state_set(BLIND_BADGE_STATE_LISTENING,
-                        "short press, speak now");
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, BLIND_BADGE_BUTTON_VOICE_STACK_SIZE);
-  ret = pthread_create(&thread, &attr, button_voice_worker, NULL);
-  pthread_attr_destroy(&attr);
-  if (ret != 0)
-    {
-      pthread_mutex_lock(&g_button_voice_lock);
-      g_button_voice_running = 0;
-      pthread_mutex_unlock(&g_button_voice_lock);
-      printf("[BlindBadge] button.voice: worker start failed: %d\n", ret);
-      blind_badge_state_set(BLIND_BADGE_STATE_ERROR,
-                            "voice worker start failed");
-      return -ret;
-    }
-
-  pthread_detach(thread);
-  return 0;
-}
 
 static void blind_badge_wifi_strip_line_end(char *line)
 {
@@ -1634,6 +1576,7 @@ static void *button_wifi_connect_worker(void *arg)
 
   if (ret == OK)
     {
+      UART_LINK_SetEventHandler(handle_uart_link_event, NULL);
       if (UART_LINK_Start() != 0)
         {
           printf("[BlindBadge] button.dn: link service start failed\n");
@@ -1769,53 +1712,10 @@ static uint64_t monotonic_milliseconds(void)
   return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
 }
 
-static void handle_button_short_press(void)
-{
-  printf("[BlindBadge] button: SHORT_PRESS\n");
-  if (start_button_voice_worker() != 0)
-    {
-      UART_LINK_SendFlag("VIBRATION_OFF");
-      return;
-    }
-
-  UART_LINK_SendFlag("VIBRATION_SHORT");
-}
-
-static void handle_button_double_press(void)
-{
-  printf("[BlindBadge] button: DOUBLE_PRESS\n");
-  blind_badge_state_set(BLIND_BADGE_STATE_RESULT, "repeat last reminder");
-  UART_LINK_SendFlag("VIBRATION_SHORT");
-  printf("[BlindBadge] button.action: repeat request acknowledged; "
-         "audio replay is not configured\n");
-}
-
-static void handle_button_long_press(void)
-{
-  struct blind_badge_cli_options options =
-    {
-      .ai_mode = BLIND_BADGE_AI_OFF,
-#ifdef CONFIG_VIDEO_FB
-      .use_lcd = 1,
-#else
-      .use_lcd = 0,
-#endif
-      .option_count = 0
-    };
-
-  printf("[BlindBadge] button: LONG_PRESS\n");
-  handle_emergency(2, &options);
-}
-
 static int handle_button_service(int argc)
 {
 #ifdef CONFIG_INPUT_BUTTONS
   btn_buttonset_t buttons = 0;
-  bool pressed = false;
-  bool long_sent = false;
-  int pending_clicks = 0;
-  uint64_t press_started_ms = 0;
-  uint64_t click_deadline_ms = 0;
   uint64_t menu_refresh_ms = 0;
   int fd;
 #ifdef CONFIG_ADC
@@ -1873,7 +1773,6 @@ static int handle_button_service(int argc)
   while (g_button_service_running)
     {
       uint64_t now_ms = monotonic_milliseconds();
-      bool current_pressed;
       ssize_t nread = read(fd, &buttons, sizeof(buttons));
 
       if (nread != sizeof(buttons))
@@ -1885,44 +1784,10 @@ static int handle_button_service(int argc)
           break;
         }
 
-      current_pressed = (buttons & 1u) != 0;
-      if (current_pressed && !pressed)
-        {
-          pressed = true;
-          long_sent = false;
-          press_started_ms = now_ms;
-        }
-      else if (current_pressed && pressed && !long_sent &&
-               now_ms - press_started_ms >= BLIND_BADGE_BUTTON_LONG_MS)
-        {
-          long_sent = true;
-          pending_clicks = 0;
-          handle_button_long_press();
-        }
-      else if (!current_pressed && pressed)
-        {
-          pressed = false;
-          if (!long_sent)
-            {
-              pending_clicks++;
-              if (pending_clicks >= 2)
-                {
-                  pending_clicks = 0;
-                  handle_button_double_press();
-                }
-              else
-                {
-                  click_deadline_ms = now_ms +
-                                      BLIND_BADGE_BUTTON_DOUBLE_MS;
-                }
-            }
-        }
-
-      if (!pressed && pending_clicks == 1 && now_ms >= click_deadline_ms)
-        {
-          pending_clicks = 0;
-          handle_button_short_press();
-        }
+      /* The discrete BOOT key intentionally has no application action.
+       * MENU, PLAY and DN- are the only runtime controls and are decoded
+       * from the ADC ladder below.
+       */
 
 #ifdef CONFIG_ADC
       if (adc_fd >= 0)

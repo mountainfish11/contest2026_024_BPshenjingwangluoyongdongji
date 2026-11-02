@@ -9,12 +9,15 @@ int UART_LINK_Wait(void);
 int UART_LINK_Stop(void);
 int UART_LINK_IsConnected(void);
 int UART_LINK_SendFlag(const char *flag);
+int UART_LINK_SendSpeech(const char *text);
 
 enum uart_link_event_type
 {
   UART_LINK_EVENT_OBSTACLE = 0,
   UART_LINK_EVENT_STEP_DOWN,
-  UART_LINK_EVENT_EMERGENCY
+  UART_LINK_EVENT_EMERGENCY,
+  UART_LINK_EVENT_ASR_RESULT,
+  UART_LINK_EVENT_VOICE_IDLE
 };
 
 struct uart_link_event
@@ -24,6 +27,7 @@ struct uart_link_event
   int confidence;
   char direction[16];
   char source[16];
+  char text[96];
 };
 
 typedef void (*uart_link_event_handler_t)(const struct uart_link_event *event,

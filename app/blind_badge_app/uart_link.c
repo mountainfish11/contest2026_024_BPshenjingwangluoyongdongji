@@ -154,6 +154,60 @@ static int send_flag_to_client(const char *flag)
   return ret;
 }
 
+static size_t utf8_prefix_length(const char *text, size_t limit)
+{
+  size_t len = strlen(text);
+
+  if (len <= limit)
+    {
+      return len;
+    }
+
+  len = limit;
+  while (len > 0 && (((unsigned char)text[len] & 0xc0) == 0x80))
+    {
+      len--;
+    }
+
+  return len;
+}
+
+int UART_LINK_SendSpeech(const char *text)
+{
+  char frame[UART_LINK_LINE_SIZE];
+  unsigned int seq;
+  size_t text_len;
+  int n;
+  int ret = -1;
+
+  if (text == NULL || text[0] == '\0')
+    {
+      return -1;
+    }
+
+  text_len = utf8_prefix_length(text, 90);
+  if (text_len == 0)
+    {
+      return -1;
+    }
+
+  pthread_mutex_lock(&g_client_lock);
+  if (g_client_fd >= 0)
+    {
+      seq = ++g_tx_seq;
+      n = snprintf(frame, sizeof(frame),
+                   "UART_LINK/1 SPEAK %u %u %.*s\n", seq,
+                   (unsigned int)text_len, (int)text_len, text);
+      if (n > 0 && (size_t)n < sizeof(frame))
+        {
+          ret = send_all(g_client_fd, frame, (size_t)n);
+        }
+    }
+
+  pthread_mutex_unlock(&g_client_lock);
+  return ret;
+}
+
 static int handle_line(const char *line)
 {
   struct uart_link_event event;
@@ -259,6 +313,10 @@ static int handle_line(const char *line)
       UART_LINK_LOG("[UART_LINK] command acknowledged: seq=%u\n", seq);
       return 0;
     }
+  else if (strcmp(type, "SPEAK_ACK") == 0)
+    {
+      return 0;
+    }
 
   memset(&event, 0, sizeof(event));
   if (strcmp(type, "OBSTACLE") == 0)
@@ -290,6 +348,24 @@ static int handle_line(const char *line)
           return 0;
         }
       event.confidence = 100;
+    }
+  else if (strcmp(type, "ASR_RESULT") == 0)
+    {
+      event.type = UART_LINK_EVENT_ASR_RESULT;
+      if (payload[0] == '\0' || strlen(payload) >= sizeof(event.text))
+        {
+          return 0;
+        }
+
+      strlcpy(event.text, payload, sizeof(event.text));
+    }
+  else if (strcmp(type, "VOICE_IDLE") == 0)
+    {
+      event.type = UART_LINK_EVENT_VOICE_IDLE;
+      if (strcmp(payload, "OK") != 0)
+        {
+          return 0;
+        }
     }
   else
     {

@@ -86,6 +86,65 @@ static int fallback_with_reason(const char *reason,
   return 0;
 }
 
+static int json_escape_string(const char *input, char *output,
+                              size_t output_size)
+{
+  size_t used = 0;
+
+  while (*input != '\0')
+    {
+      const char *escape = NULL;
+
+      switch (*input)
+        {
+          case '"':
+            escape = "\\\"";
+            break;
+          case '\\':
+            escape = "\\\\";
+            break;
+          case '\n':
+            escape = "\\n";
+            break;
+          case '\r':
+            escape = "\\r";
+            break;
+          case '\t':
+            escape = "\\t";
+            break;
+          default:
+            break;
+        }
+
+      if (escape != NULL)
+        {
+          size_t length = strlen(escape);
+
+          if (used + length >= output_size)
+            {
+              return -1;
+            }
+
+          memcpy(output + used, escape, length);
+          used += length;
+        }
+      else
+        {
+          if (used + 1 >= output_size)
+            {
+              return -1;
+            }
+
+          output[used++] = *input;
+        }
+
+      input++;
+    }
+
+  output[used] = '\0';
+  return 0;
+}
+
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 static int ask_agent(const char *ai_prompt,
                      const char *local_suggestion,
@@ -181,6 +240,7 @@ static int ask_ai_direct(const char *ai_prompt,
     "100厘米及以上只提醒保持注意；step_down必须提醒停下或放慢并确认；"
     "emergency输出适合联系人或附近人员的一句求助信息。";
   char messages_json[768];
+  char escaped_prompt[640];
   char raw_response[512];
   int ret;
 
@@ -216,8 +276,16 @@ static int ask_ai_direct(const char *ai_prompt,
                                   used_fallback);
     }
 
+  if (json_escape_string(ai_prompt, escaped_prompt,
+                         sizeof(escaped_prompt)) != 0)
+    {
+      return fallback_with_reason("AI prompt is too long",
+                                  local_suggestion, response, response_size,
+                                  used_fallback);
+    }
+
   snprintf(messages_json, sizeof(messages_json),
-           "[{\"role\":\"user\",\"content\":\"%s\"}]", ai_prompt);
+           "[{\"role\":\"user\",\"content\":\"%s\"}]", escaped_prompt);
 
   printf("[BlindBadge] ai_status: calling ai_agent llm router...\n");
   memset(raw_response, 0, sizeof(raw_response));
