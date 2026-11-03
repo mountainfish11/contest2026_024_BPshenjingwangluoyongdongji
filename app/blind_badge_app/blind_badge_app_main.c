@@ -85,8 +85,10 @@
 #define BLIND_BADGE_WIFI_SD_BLOCK_DEVICE "/dev/mmcsd1"
 #define BLIND_BADGE_WIFI_SD_MOUNT_POINT "/mnt/sdcard"
 #define BLIND_BADGE_WIFI_SD_CONFIG "/mnt/sdcard/WIFI.CFG"
+#define BLIND_BADGE_AI_SD_KEY "/mnt/sdcard/MIMO.KEY"
 #define BLIND_BADGE_WIFI_SSID_SIZE 33
 #define BLIND_BADGE_WIFI_PASSWORD_SIZE 64
+#define BLIND_BADGE_AI_SD_STACK_SIZE 8192
 #define BLIND_BADGE_VISION_DEFAULT_PORT 45681
 #define BLIND_BADGE_VISION_HTTP_DEFAULT_PORT 80
 
@@ -1397,6 +1399,7 @@ static int handle_emergency(int argc,
 
 static volatile int g_button_service_running;
 static pthread_mutex_t g_button_wifi_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_sd_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_button_wifi_running;
 static bool g_wifi_sd_mounted;
 
@@ -1418,10 +1421,13 @@ static int blind_badge_wifi_mount_sd(void)
   int probe_fd;
   int probe_ret = ERROR;
   int attempt;
+  int ret = ERROR;
 
+  pthread_mutex_lock(&g_sd_mount_lock);
   if (g_wifi_sd_mounted)
     {
-      return OK;
+      ret = OK;
+      goto out;
     }
 
   mkdir("/mnt", 0755);
@@ -1439,13 +1445,13 @@ static int blind_badge_wifi_mount_sd(void)
 
   if (attempt == 50)
     {
-      return ERROR;
+      goto out;
     }
 
   probe_fd = open(BLIND_BADGE_WIFI_SD_BLOCK_DEVICE, O_RDONLY);
   if (probe_fd < 0)
     {
-      return ERROR;
+      goto out;
     }
 
   /* The block node is registered even when the card's power-on probe has
@@ -1468,18 +1474,21 @@ static int blind_badge_wifi_mount_sd(void)
   close(probe_fd);
   if (probe_ret != OK)
     {
-      return ERROR;
+      goto out;
     }
 
   if (mount(BLIND_BADGE_WIFI_SD_BLOCK_DEVICE,
             BLIND_BADGE_WIFI_SD_MOUNT_POINT, "vfat", 0, NULL) < 0 &&
       errno != EBUSY)
     {
-      return ERROR;
+      goto out;
     }
 
   g_wifi_sd_mounted = true;
-  return OK;
+  ret = OK;
+out:
+  pthread_mutex_unlock(&g_sd_mount_lock);
+  return ret;
 #else
   return ERROR;
 #endif
@@ -1548,6 +1557,43 @@ static int blind_badge_wifi_load_sd_config(char *ssid, size_t ssid_size,
 
   fclose(file);
   return have_ssid && have_password ? OK : ERROR;
+}
+
+static void *blind_badge_ai_sd_worker(void *arg)
+{
+  (void)arg;
+
+  if (blind_badge_wifi_mount_sd() == OK &&
+      blind_badge_ai_import_mimo(BLIND_BADGE_AI_SD_KEY) == 0)
+    {
+      printf("[BlindBadge] AI configuration: ready from SD\n");
+    }
+  else
+    {
+      printf("[BlindBadge] AI configuration: unavailable\n");
+    }
+
+  return NULL;
+}
+
+static void blind_badge_start_ai_sd_worker(void)
+{
+  pthread_attr_t attr;
+  pthread_t thread;
+  int ret;
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, BLIND_BADGE_AI_SD_STACK_SIZE);
+  ret = pthread_create(&thread, &attr, blind_badge_ai_sd_worker, NULL);
+  pthread_attr_destroy(&attr);
+  if (ret == 0)
+    {
+      pthread_detach(thread);
+    }
+  else
+    {
+      printf("[BlindBadge] AI configuration: loader start failed\n");
+    }
 }
 
 static void *button_wifi_connect_worker(void *arg)
@@ -1769,6 +1815,7 @@ static int handle_button_service(int argc)
 
   g_button_service_running = 1;
   blind_badge_menu_show();
+  blind_badge_start_ai_sd_worker();
 
   while (g_button_service_running)
     {

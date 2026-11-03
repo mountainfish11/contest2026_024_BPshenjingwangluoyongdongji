@@ -578,6 +578,11 @@ static const uint8_t g_menu_settings_icon[8] =
   0x18, 0x5a, 0x7e, 0xe7, 0xe7, 0x7e, 0x5a, 0x18
 };
 
+static const uint8_t g_menu_test_icon[8] =
+{
+  0x18, 0x18, 0x18, 0x3c, 0x3c, 0x7e, 0x7e, 0x3c
+};
+
 static const uint8_t *menu_icon_bitmap(enum blind_badge_menu_icon icon)
 {
   switch (icon)
@@ -590,6 +595,8 @@ static const uint8_t *menu_icon_bitmap(enum blind_badge_menu_icon icon)
         return g_menu_heart_icon;
       case BLIND_BADGE_MENU_ICON_BELL:
         return g_menu_bell_icon;
+      case BLIND_BADGE_MENU_ICON_TEST:
+        return g_menu_test_icon;
       case BLIND_BADGE_MENU_ICON_SETTINGS:
       default:
         return g_menu_settings_icon;

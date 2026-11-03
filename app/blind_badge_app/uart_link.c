@@ -115,6 +115,12 @@ static int send_client_data(const char *data, size_t len)
   if (g_client_fd >= 0)
     {
       ret = send_all(g_client_fd, data, len);
+      if (ret != 0)
+        {
+          close(g_client_fd);
+          g_client_fd = -1;
+          g_connected = 0;
+        }
     }
   pthread_mutex_unlock(&g_client_lock);
   return ret;
@@ -147,6 +153,12 @@ static int send_flag_to_client(const char *flag)
             {
               UART_LINK_LOG("[UART_LINK] command sent: seq=%u flag=%s\n",
                             seq, flag);
+            }
+          else
+            {
+              close(g_client_fd);
+              g_client_fd = -1;
+              g_connected = 0;
             }
         }
     }
@@ -201,6 +213,12 @@ int UART_LINK_SendSpeech(const char *text)
       if (n > 0 && (size_t)n < sizeof(frame))
         {
           ret = send_all(g_client_fd, frame, (size_t)n);
+          if (ret != 0)
+            {
+              close(g_client_fd);
+              g_client_fd = -1;
+              g_connected = 0;
+            }
         }
     }
 

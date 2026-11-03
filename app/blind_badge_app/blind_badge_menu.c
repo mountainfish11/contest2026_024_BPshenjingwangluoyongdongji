@@ -70,6 +70,12 @@ static const struct blind_badge_menu_item g_menu_items[] =
     BLIND_BADGE_MENU_ICON_SETTINGS,
     "SETTINGS",
     "MENU_SETTINGS"
+  },
+  {
+    BLIND_BADGE_MENU_TEST,
+    BLIND_BADGE_MENU_ICON_TEST,
+    "TEST",
+    NULL
   }
 };
 
@@ -151,7 +157,12 @@ static void menu_announce_selected(void)
       return;
     }
 
-  if (UART_LINK_SendFlag(g_menu_items[g_menu_selected].speech_flag) == 0)
+  if (g_menu_items[g_menu_selected].speech_flag == NULL)
+    {
+      g_menu_announced = (int)g_menu_selected;
+    }
+  else if (UART_LINK_SendFlag(
+             g_menu_items[g_menu_selected].speech_flag) == 0)
     {
       g_menu_announced = (int)g_menu_selected;
     }
@@ -292,27 +303,14 @@ int blind_badge_menu_enter(void)
 
 int blind_badge_menu_leave(void)
 {
-  const char *labels[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
-  enum blind_badge_menu_icon
-    icons[sizeof(g_menu_items) / sizeof(g_menu_items[0])];
-
   if (g_menu_page == BLIND_BADGE_MENU_PAGE_SERVICE)
     {
-      blind_badge_service_stop();
+      (void)blind_badge_service_stop();
       g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
       g_menu_redraw_pending = false;
       g_menu_announced = -1;
-
-      /* Returning to the menu must never depend on a remote VOICE_IDLE
-       * packet.  Service cleanup may remain STOPPING in the background, but
-       * the operator gets the menu back immediately.  Starting another task
-       * is still rejected until cleanup reaches IDLE.
-       */
-      menu_build_arrays(labels, icons);
-      return blind_badge_display_show_menu(
-               labels, icons,
-               sizeof(g_menu_items) / sizeof(g_menu_items[0]),
-               g_menu_selected);
+      g_speech_mode_sent = -1;
+      return blind_badge_menu_show();
     }
 
   return blind_badge_menu_show();

@@ -9,10 +9,12 @@
 #include <nuttx/config.h>
 
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+#include "agent_config.h"
 #include "core/message_bus.h"
 #include "core/message_bus_tap.h"
 #include "infra/config_store.h"
 #include "infra/network_manager.h"
+#include "infra/vela_tls.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 
@@ -30,6 +32,87 @@
 #define BLIND_BADGE_AGENT_CHANNEL "blind_badge"
 #define BLIND_BADGE_AGENT_CHAT_ID "badge_event"
 #define BLIND_BADGE_AGENT_TIMEOUT_MS 75000
+
+static volatile int g_blind_badge_ai_ready;
+
+int blind_badge_ai_import_mimo(const char *path)
+{
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  llm_backend_t backend;
+  char key[128] = { 0 };
+  FILE *file;
+  size_t length;
+  int ret = -1;
+
+  if (path == NULL || path[0] == '\0')
+    {
+      return -1;
+    }
+
+  file = fopen(path, "r");
+  if (file == NULL)
+    {
+      return -1;
+    }
+
+  length = fread(key, 1, sizeof(key) - 1, file);
+  if (fgetc(file) != EOF)
+    {
+      fclose(file);
+      memset(key, 0, sizeof(key));
+      return -1;
+    }
+
+  fclose(file);
+  key[length] = '\0';
+  while (length > 0 &&
+         (key[length - 1] == '\r' || key[length - 1] == '\n' ||
+          key[length - 1] == ' ' || key[length - 1] == '\t'))
+    {
+      key[--length] = '\0';
+    }
+
+  if (length > 0)
+    {
+      memset(&backend, 0, sizeof(backend));
+      strlcpy(backend.host, AGENT_LLM_MIMO_HOST, sizeof(backend.host));
+      strlcpy(backend.path, AGENT_LLM_MIMO_PATH, sizeof(backend.path));
+      strlcpy(backend.port, "443", sizeof(backend.port));
+      strlcpy(backend.model, AGENT_LLM_MIMO_MODEL, sizeof(backend.model));
+      strlcpy(backend.api_key, key, sizeof(backend.api_key));
+      backend.priority = 0;
+      backend.cost_tier = 1;
+      backend.enabled = true;
+
+      if (config_store_init() == 0 && llm_proxy_init() == 0 &&
+          llm_router_init() == 0)
+        {
+          ret = llm_router_set_backend_runtime(0, &backend);
+        }
+
+      memset(&backend, 0, sizeof(backend));
+    }
+
+  memset(key, 0, sizeof(key));
+  g_blind_badge_ai_ready = ret == 0;
+  return ret;
+#else
+  (void)path;
+  return -1;
+#endif
+}
+
+int blind_badge_ai_ready(void)
+{
+  return g_blind_badge_ai_ready;
+}
+
+void blind_badge_ai_cancel_active(void)
+{
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  vela_tls_abort_active();
+#endif
+}
 
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
 struct blind_badge_agent_waiter
