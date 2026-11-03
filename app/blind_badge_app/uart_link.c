@@ -22,7 +22,10 @@
 #define UART_LINK_CONTROL_QUEUE  "blind_badge_link"
 #define UART_LINK_CONTROL_PATH   "/var/mqueue/blind_badge_link"
 #define UART_LINK_FLAG_SIZE      32
-#define UART_LINK_SPEECH_ACK_MS  750
+#define UART_LINK_SPEECH_ACK_MS  5000
+#define UART_LINK_ACK_POLL_US    20000
+#define UART_LINK_SEND_WAIT_US   200000
+#define UART_LINK_SEND_RETRIES   5
 
 /* The UART link must keep working when no USB serial reader is attached.
  * Printing from this network thread can fill the CDC TX buffer and block the
@@ -40,7 +43,6 @@ static int g_client_fd = -1;
 static unsigned int g_tx_seq;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_speech_ack_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_speech_ack_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int g_speech_ack_seq;
 static uart_link_event_handler_t g_event_handler;
 static void *g_event_handler_arg;
@@ -86,15 +88,50 @@ static int valid_flag(const char *flag, size_t *flag_len)
 
 static int send_all(int fd, const char *data, size_t len)
 {
+  int wait_count = 0;
+
   while (len > 0)
     {
       ssize_t n = send(fd, data, len, 0);
-      if (n <= 0)
+
+      if (n > 0)
         {
-          return -1;
+          data += n;
+          len -= n;
+          wait_count = 0;
+          continue;
         }
-      data += n;
-      len -= n;
+
+      if (n < 0 && errno == EINTR)
+        {
+          continue;
+        }
+
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+          wait_count++ < UART_LINK_SEND_RETRIES)
+        {
+          fd_set writefds;
+          struct timeval timeout =
+            {
+              0, UART_LINK_SEND_WAIT_US
+            };
+          int ready;
+
+          FD_ZERO(&writefds);
+          FD_SET(fd, &writefds);
+          ready = select(fd + 1, NULL, &writefds, NULL, &timeout);
+          if (ready > 0)
+            {
+              continue;
+            }
+
+          if (ready < 0 && errno == EINTR)
+            {
+              continue;
+            }
+        }
+
+      return -1;
     }
   return 0;
 }
@@ -191,10 +228,9 @@ static size_t utf8_prefix_length(const char *text, size_t limit)
 int UART_LINK_SendSpeech(const char *text)
 {
   char frame[UART_LINK_LINE_SIZE];
-  struct timespec deadline;
+  struct timespec started;
   unsigned int seq;
   size_t text_len;
-  int sent_fd = -1;
   int n;
   int ret = -1;
 
@@ -212,7 +248,6 @@ int UART_LINK_SendSpeech(const char *text)
   pthread_mutex_lock(&g_client_lock);
   if (g_client_fd >= 0)
     {
-      sent_fd = g_client_fd;
       seq = ++g_tx_seq;
       n = snprintf(frame, sizeof(frame),
                    "UART_LINK/1 SPEAK %u %u %.*s\n", seq,
@@ -241,54 +276,39 @@ int UART_LINK_SendSpeech(const char *text)
    * delivered only after the peer acknowledges the matching sequence.
    */
 
-  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+  if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
     {
       return -1;
     }
 
-  deadline.tv_nsec += UART_LINK_SPEECH_ACK_MS * 1000000L;
-  if (deadline.tv_nsec >= 1000000000L)
+  for (;;)
     {
-      deadline.tv_sec++;
-      deadline.tv_nsec -= 1000000000L;
-    }
+      struct timespec now;
+      long elapsed_ms;
 
-  pthread_mutex_lock(&g_speech_ack_lock);
-  while (g_speech_ack_seq != seq && g_connected)
-    {
-      int wait_ret = pthread_cond_timedwait(&g_speech_ack_cond,
-                                            &g_speech_ack_lock,
-                                            &deadline);
-      if (wait_ret == ETIMEDOUT)
+      pthread_mutex_lock(&g_speech_ack_lock);
+      ret = g_speech_ack_seq == seq ? 0 : -1;
+      pthread_mutex_unlock(&g_speech_ack_lock);
+      if (ret == 0 || !g_connected)
         {
           break;
         }
-    }
 
-  ret = g_speech_ack_seq == seq ? 0 : -1;
-  pthread_mutex_unlock(&g_speech_ack_lock);
-
-  if (ret != 0)
-    {
-      /* No ACK means this socket cannot be trusted even when send() said
-       * success.  Close only the exact descriptor used above; a newly
-       * accepted connection must not be disturbed by this timeout.
-       */
-
-      pthread_mutex_lock(&g_client_lock);
-      if (g_client_fd == sent_fd)
+      if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         {
-          struct linger abortive = { 1, 0 };
-
-          setsockopt(g_client_fd, SOL_SOCKET, SO_LINGER,
-                     &abortive, sizeof(abortive));
-          shutdown(g_client_fd, SHUT_RDWR);
-          close(g_client_fd);
-          g_client_fd = -1;
-          g_connected = 0;
+          ret = -1;
+          break;
         }
 
-      pthread_mutex_unlock(&g_client_lock);
+      elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L +
+                   (now.tv_nsec - started.tv_nsec) / 1000000L;
+      if (elapsed_ms >= UART_LINK_SPEECH_ACK_MS)
+        {
+          ret = -1;
+          break;
+        }
+
+      usleep(UART_LINK_ACK_POLL_US);
     }
 
   return ret;
@@ -412,7 +432,6 @@ static int handle_line(const char *line)
         {
           pthread_mutex_lock(&g_speech_ack_lock);
           g_speech_ack_seq = seq;
-          pthread_cond_broadcast(&g_speech_ack_cond);
           pthread_mutex_unlock(&g_speech_ack_lock);
         }
 
@@ -634,11 +653,10 @@ static void *uart_link_thread(void *arg)
           int fd = accept(g_listen_fd, NULL, NULL);
           if (fd >= 0)
             {
-              int flags = fcntl(fd, F_GETFL, 0);
-              if (flags >= 0)
-                {
-                  fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-                }
+              struct timeval send_timeout = { 1, 0 };
+
+              setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout,
+                         sizeof(send_timeout));
 
               close_client();
               pthread_mutex_lock(&g_client_lock);

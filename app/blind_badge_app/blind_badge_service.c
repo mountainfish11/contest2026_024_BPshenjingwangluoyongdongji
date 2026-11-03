@@ -21,7 +21,6 @@
 #define BLIND_BADGE_VISION_STACK_SIZE 16384
 #define BLIND_BADGE_VISION_DISPLAY_SETTLE_US 500000
 #define BLIND_BADGE_VOICE_STACK_SIZE 16384
-#define BLIND_BADGE_VOICE_PRIORITY 100
 #define BLIND_BADGE_VOICE_TEXT_SIZE 96
 #define BLIND_BADGE_VOICE_REPLY_SIZE 256
 #define BLIND_BADGE_VOICE_DETAIL_SIZE 40
@@ -56,7 +55,8 @@ static int g_vision_result;
 static int g_alert_result;
 static pthread_cond_t g_voice_cond = PTHREAD_COND_INITIALIZER;
 static bool g_voice_task_active;
-static pid_t g_voice_task_pid = -1;
+static bool g_voice_thread_joinable;
+static pthread_t g_voice_thread;
 static bool g_voice_cancel_requested;
 static bool g_voice_text_pending;
 static bool g_voice_sub_idle;
@@ -242,16 +242,16 @@ static int voice_resume_listening(unsigned int generation)
   return -EIO;
 }
 
-static int voice_service_worker(int argc, char *argv[])
+static void *voice_service_worker(void *arg)
 {
   char recognized[BLIND_BADGE_VOICE_TEXT_SIZE];
   char response[BLIND_BADGE_VOICE_REPLY_SIZE];
   unsigned int generation;
   int used_fallback;
+  int link_ret;
   int ret;
 
-  (void)argc;
-  (void)argv;
+  (void)arg;
   generation = g_voice_generation;
   pthread_mutex_lock(&g_service_lock);
   while (!g_voice_cancel_requested && generation == g_voice_generation)
@@ -278,12 +278,26 @@ static int voice_service_worker(int argc, char *argv[])
        */
 
       pthread_mutex_unlock(&g_service_lock);
+
+      /* NuttX on this board currently stalls the local control socket while
+       * a blocking public TLS handshake is active.  Release that socket for
+       * the request, then reopen the listener so the sub-board can reconnect
+       * before the reply is delivered.
+       */
+
+      (void)UART_LINK_Stop();
       memset(response, 0, sizeof(response));
       used_fallback = 0;
       ret = blind_badge_ask_ai(
               BLIND_BADGE_AI_DIRECT, recognized,
               "我听到了，请再说一遍需要我帮什么。",
               response, sizeof(response), &used_fallback);
+      link_ret = UART_LINK_Start();
+      if (ret == 0 && link_ret != 0)
+        {
+          ret = -EIO;
+        }
+
       pthread_mutex_lock(&g_service_lock);
 
       if (g_voice_cancel_requested || generation != g_voice_generation)
@@ -348,7 +362,6 @@ static int voice_service_worker(int argc, char *argv[])
     }
 
   g_voice_task_active = false;
-  g_voice_task_pid = -1;
   if (g_service_active == BLIND_BADGE_MENU_VOICE &&
       g_service_state == BLIND_BADGE_SERVICE_STOPPING &&
       g_voice_sub_idle)
@@ -357,12 +370,14 @@ static int voice_service_worker(int argc, char *argv[])
     }
 
   pthread_mutex_unlock(&g_service_lock);
-  return 0;
+  return NULL;
 }
 
 static int voice_service_start(void)
 {
-  pid_t pid;
+  pthread_attr_t attr;
+  pthread_t thread;
+  int ret;
 
   if (!UART_LINK_IsConnected())
     {
@@ -387,16 +402,18 @@ static int voice_service_start(void)
   strlcpy(g_voice_detail, "listening", sizeof(g_voice_detail));
   g_voice_task_active = true;
 
-  pid = task_create("bb_voice", BLIND_BADGE_VOICE_PRIORITY,
-                    BLIND_BADGE_VOICE_STACK_SIZE,
-                    voice_service_worker, NULL);
-  if (pid < 0)
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, BLIND_BADGE_VOICE_STACK_SIZE);
+  ret = pthread_create(&thread, &attr, voice_service_worker, NULL);
+  pthread_attr_destroy(&attr);
+  if (ret != 0)
     {
       g_voice_task_active = false;
-      return -errno;
+      return -ret;
     }
 
-  g_voice_task_pid = pid;
+  g_voice_thread = thread;
+  g_voice_thread_joinable = true;
   if (UART_LINK_SendFlag("VOICE_START") != 0)
     {
       g_voice_cancel_requested = true;
@@ -560,7 +577,8 @@ int blind_badge_service_stop(void)
   enum blind_badge_menu_id active;
   bool vision_joinable = false;
   pthread_t vision_thread = 0;
-  pid_t voice_task_pid = -1;
+  bool voice_joinable = false;
+  pthread_t voice_thread = 0;
   pid_t test_task_pid = -1;
 
   pthread_mutex_lock(&g_service_lock);
@@ -580,7 +598,8 @@ int blind_badge_service_stop(void)
       g_voice_text_pending = false;
       g_voice_text[0] = '\0';
       g_voice_sub_idle = false;
-      voice_task_pid = g_voice_task_pid;
+      voice_joinable = g_voice_thread_joinable;
+      voice_thread = g_voice_thread;
       pthread_cond_broadcast(&g_voice_cond);
     }
   else if (active == BLIND_BADGE_MENU_TEST)
@@ -629,9 +648,14 @@ int blind_badge_service_stop(void)
           usleep(20000);
         }
 
-      if (active_now && voice_task_pid > 0)
+      if (active_now && voice_joinable)
         {
-          (void)task_delete(voice_task_pid);
+          (void)pthread_cancel(voice_thread);
+        }
+
+      if (voice_joinable)
+        {
+          (void)pthread_join(voice_thread, NULL);
         }
 
       blind_badge_ai_reset_aborted();
@@ -672,7 +696,7 @@ int blind_badge_service_stop(void)
   else if (active == BLIND_BADGE_MENU_VOICE)
     {
       g_voice_task_active = false;
-      g_voice_task_pid = -1;
+      g_voice_thread_joinable = false;
       g_voice_cancel_requested = false;
       g_voice_text_pending = false;
       g_voice_sub_idle = true;
