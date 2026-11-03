@@ -21,5 +21,7 @@ int blind_badge_ask_ai(enum blind_badge_ai_mode mode,
 
 int blind_badge_ai_import_mimo(const char *path);
 int blind_badge_ai_ready(void);
+void blind_badge_ai_begin_session(void);
 void blind_badge_ai_cancel_active(void);
+void blind_badge_ai_reset_aborted(void);
 

@@ -22,6 +22,7 @@
 #define UART_LINK_CONTROL_QUEUE  "blind_badge_link"
 #define UART_LINK_CONTROL_PATH   "/var/mqueue/blind_badge_link"
 #define UART_LINK_FLAG_SIZE      32
+#define UART_LINK_SPEECH_ACK_MS  750
 
 /* The UART link must keep working when no USB serial reader is attached.
  * Printing from this network thread can fill the CDC TX buffer and block the
@@ -38,6 +39,9 @@ static int g_listen_fd = -1;
 static int g_client_fd = -1;
 static unsigned int g_tx_seq;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_speech_ack_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_speech_ack_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int g_speech_ack_seq;
 static uart_link_event_handler_t g_event_handler;
 static void *g_event_handler_arg;
 
@@ -187,8 +191,10 @@ static size_t utf8_prefix_length(const char *text, size_t limit)
 int UART_LINK_SendSpeech(const char *text)
 {
   char frame[UART_LINK_LINE_SIZE];
+  struct timespec deadline;
   unsigned int seq;
   size_t text_len;
+  int sent_fd = -1;
   int n;
   int ret = -1;
 
@@ -206,6 +212,7 @@ int UART_LINK_SendSpeech(const char *text)
   pthread_mutex_lock(&g_client_lock);
   if (g_client_fd >= 0)
     {
+      sent_fd = g_client_fd;
       seq = ++g_tx_seq;
       n = snprintf(frame, sizeof(frame),
                    "UART_LINK/1 SPEAK %u %u %.*s\n", seq,
@@ -223,6 +230,67 @@ int UART_LINK_SendSpeech(const char *text)
     }
 
   pthread_mutex_unlock(&g_client_lock);
+  if (ret != 0)
+    {
+      return ret;
+    }
+
+  /* A successful send() only means that the frame entered the local TCP
+   * buffer.  During a Wi-Fi reconnect the old socket can accept the write
+   * and then disappear before the sub-board receives it.  Treat SPEAK as
+   * delivered only after the peer acknowledges the matching sequence.
+   */
+
+  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+    {
+      return -1;
+    }
+
+  deadline.tv_nsec += UART_LINK_SPEECH_ACK_MS * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L)
+    {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000L;
+    }
+
+  pthread_mutex_lock(&g_speech_ack_lock);
+  while (g_speech_ack_seq != seq && g_connected)
+    {
+      int wait_ret = pthread_cond_timedwait(&g_speech_ack_cond,
+                                            &g_speech_ack_lock,
+                                            &deadline);
+      if (wait_ret == ETIMEDOUT)
+        {
+          break;
+        }
+    }
+
+  ret = g_speech_ack_seq == seq ? 0 : -1;
+  pthread_mutex_unlock(&g_speech_ack_lock);
+
+  if (ret != 0)
+    {
+      /* No ACK means this socket cannot be trusted even when send() said
+       * success.  Close only the exact descriptor used above; a newly
+       * accepted connection must not be disturbed by this timeout.
+       */
+
+      pthread_mutex_lock(&g_client_lock);
+      if (g_client_fd == sent_fd)
+        {
+          struct linger abortive = { 1, 0 };
+
+          setsockopt(g_client_fd, SOL_SOCKET, SO_LINGER,
+                     &abortive, sizeof(abortive));
+          shutdown(g_client_fd, SHUT_RDWR);
+          close(g_client_fd);
+          g_client_fd = -1;
+          g_connected = 0;
+        }
+
+      pthread_mutex_unlock(&g_client_lock);
+    }
+
   return ret;
 }
 
@@ -309,11 +377,18 @@ static int handle_line(const char *line)
   if (strcmp(type, "HELLO") == 0)
     {
       char ack[96];
+      int ret;
       int n = snprintf(ack, sizeof(ack),
                        "UART_LINK/1 HELLO_ACK %u 2 OK\n", seq);
       UART_LINK_LOG("[UART_LINK] RX type=HELLO seq=%u payload=%s\n", seq,
                     payload);
-      return send_client_data(ack, (size_t)n);
+      ret = send_client_data(ack, (size_t)n);
+      if (ret == 0)
+        {
+          g_connected = 1;
+        }
+
+      return ret;
     }
   else if (strcmp(type, "PING") == 0)
     {
@@ -333,6 +408,14 @@ static int handle_line(const char *line)
     }
   else if (strcmp(type, "SPEAK_ACK") == 0)
     {
+      if (strcmp(payload, "OK") == 0)
+        {
+          pthread_mutex_lock(&g_speech_ack_lock);
+          g_speech_ack_seq = seq;
+          pthread_cond_broadcast(&g_speech_ack_cond);
+          pthread_mutex_unlock(&g_speech_ack_lock);
+        }
+
       return 0;
     }
 
@@ -417,6 +500,7 @@ static void *uart_link_thread(void *arg)
   struct mq_attr mq_attr;
   struct sockaddr_in addr;
   char buffer[UART_LINK_LINE_SIZE];
+  char pending_flag[UART_LINK_FLAG_SIZE] = { 0 };
   size_t used = 0;
   time_t last_activity = 0;
   (void)arg;
@@ -487,24 +571,40 @@ static void *uart_link_thread(void *arg)
           used = 0;
         }
 
-      while (control_mq != (mqd_t)-1)
+      /* Do not consume control commands while the sub-board is offline.
+       * Keep the current command pending if a send detects a disconnect, then
+       * retry it after the next TCP handshake.  The menu treats a successful
+       * mq_send() as accepted ownership, so dropping the command here would
+       * otherwise leave the sub-board stuck in SILENT mode indefinitely.
+       */
+
+      while (control_mq != (mqd_t)-1 && g_client_fd >= 0 && g_connected)
         {
-          char flag[UART_LINK_FLAG_SIZE];
-          ssize_t n = mq_receive(control_mq, flag, sizeof(flag), NULL);
-          if (n < 0)
+          if (pending_flag[0] == '\0')
             {
+              ssize_t n = mq_receive(control_mq, pending_flag,
+                                     sizeof(pending_flag), NULL);
+              if (n < 0)
+                {
+                  break;
+                }
+              if ((size_t)n >= sizeof(pending_flag))
+                {
+                  pending_flag[0] = '\0';
+                  continue;
+                }
+
+              pending_flag[n] = '\0';
+            }
+
+          if (send_flag_to_client(pending_flag) != 0)
+            {
+              UART_LINK_LOG("[UART_LINK] command retained: disconnected "
+                            "flag=%s\n", pending_flag);
               break;
             }
-          if ((size_t)n >= sizeof(flag))
-            {
-              continue;
-            }
-          flag[n] = '\0';
-          if (send_flag_to_client(flag) != 0)
-            {
-              UART_LINK_LOG("[UART_LINK] command dropped: disconnected "
-                            "flag=%s\n", flag);
-            }
+
+          pending_flag[0] = '\0';
         }
 
       if (FD_ISSET(discovery_fd, &readfds))
@@ -543,7 +643,13 @@ static void *uart_link_thread(void *arg)
               close_client();
               pthread_mutex_lock(&g_client_lock);
               g_client_fd = fd;
-              g_connected = 1;
+              /* A TCP accept is not yet a usable protocol connection.
+               * Publish readiness only after HELLO has been parsed and its
+               * HELLO_ACK sent, otherwise SPEAK/COMMAND can race ahead of
+               * the sub-board handshake.
+               */
+
+              g_connected = 0;
               pthread_mutex_unlock(&g_client_lock);
               used = 0;
               last_activity = monotonic_seconds();

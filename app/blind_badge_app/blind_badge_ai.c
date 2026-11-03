@@ -32,8 +32,10 @@
 #define BLIND_BADGE_AGENT_CHANNEL "blind_badge"
 #define BLIND_BADGE_AGENT_CHAT_ID "badge_event"
 #define BLIND_BADGE_AGENT_TIMEOUT_MS 75000
+#define BLIND_BADGE_DIRECT_TIMEOUT_SEC 15
 
 static volatile int g_blind_badge_ai_ready;
+static volatile int g_blind_badge_ai_cancelled;
 
 int blind_badge_ai_import_mimo(const char *path)
 {
@@ -88,6 +90,10 @@ int blind_badge_ai_import_mimo(const char *path)
           llm_router_init() == 0)
         {
           ret = llm_router_set_backend_runtime(0, &backend);
+          if (ret == 0)
+            {
+              ret = llm_router_apply(0);
+            }
         }
 
       memset(&backend, 0, sizeof(backend));
@@ -107,10 +113,32 @@ int blind_badge_ai_ready(void)
   return g_blind_badge_ai_ready;
 }
 
+void blind_badge_ai_begin_session(void)
+{
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  /* A Wi-Fi reconnect can leave an idle pooled TLS socket looking valid
+   * locally after the peer has discarded it.  Start each user-visible AI
+   * session from a fresh connection; requests within the session may still
+   * reuse the newly established connection.
+   */
+
+  g_blind_badge_ai_cancelled = 0;
+  vela_tls_pool_cleanup();
+#endif
+}
+
 void blind_badge_ai_cancel_active(void)
 {
 #ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  g_blind_badge_ai_cancelled = 1;
   vela_tls_abort_active();
+#endif
+}
+
+void blind_badge_ai_reset_aborted(void)
+{
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA
+  vela_tls_reset_aborted();
 #endif
 }
 
@@ -327,37 +355,9 @@ static int ask_ai_direct(const char *ai_prompt,
   char raw_response[512];
   int ret;
 
-  ret = config_store_init();
-  if (ret != 0)
-    {
-      return fallback_with_reason("config_store_init failed",
-                                  local_suggestion, response, response_size,
-                                  used_fallback);
-    }
-
-  ret = llm_proxy_init();
-  if (ret != 0)
-    {
-      return fallback_with_reason("llm_proxy_init failed",
-                                  local_suggestion, response, response_size,
-                                  used_fallback);
-    }
-
-  ret = llm_router_init();
-  if (ret != 0)
-    {
-      return fallback_with_reason("llm_router_init failed",
-                                  local_suggestion, response, response_size,
-                                  used_fallback);
-    }
-
-  ret = llm_router_apply(0);
-  if (ret != 0)
-    {
-      return fallback_with_reason("no router backend at slot 0",
-                                  local_suggestion, response, response_size,
-                                  used_fallback);
-    }
+  /* AI configuration, router initialization, and backend application are
+   * completed once while SD-card credentials are imported at boot.  Service
+   * workers only issue requests; they must not rewrite global LLM config. */
 
   if (json_escape_string(ai_prompt, escaped_prompt,
                          sizeof(escaped_prompt)) != 0)
@@ -371,9 +371,26 @@ static int ask_ai_direct(const char *ai_prompt,
            "[{\"role\":\"user\",\"content\":\"%s\"}]", escaped_prompt);
 
   printf("[BlindBadge] ai_status: calling ai_agent llm router...\n");
+  vela_tls_set_request_timeout(BLIND_BADGE_DIRECT_TIMEOUT_SEC);
   memset(raw_response, 0, sizeof(raw_response));
   ret = llm_chat(system_prompt, messages_json, raw_response,
                  sizeof(raw_response));
+  if (ret != 0 && !g_blind_badge_ai_cancelled)
+    {
+      /* The peer can silently discard a keep-alive socket after a Wi-Fi
+       * reconnect.  Discard that pool entry and retry once with a fresh TLS
+       * connection.  A service cancellation suppresses this retry.
+       */
+
+      printf("[BlindBadge] ai_status: reconnecting AI request...\n");
+      vela_tls_pool_cleanup();
+      memset(raw_response, 0, sizeof(raw_response));
+      ret = llm_chat(system_prompt, messages_json, raw_response,
+                     sizeof(raw_response));
+    }
+
+  vela_tls_set_request_timeout(0);
+
   if (ret != 0)
     {
       return fallback_with_reason(raw_response[0] ? raw_response :
