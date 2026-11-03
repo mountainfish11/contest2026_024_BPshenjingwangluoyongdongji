@@ -36,7 +36,6 @@ struct blind_badge_menu_item
   enum blind_badge_menu_id id;
   enum blind_badge_menu_icon icon;
   const char *label;
-  const char *speech_flag;
 };
 
 static const struct blind_badge_menu_item g_menu_items[] =
@@ -44,45 +43,38 @@ static const struct blind_badge_menu_item g_menu_items[] =
   {
     BLIND_BADGE_MENU_VISION,
     BLIND_BADGE_MENU_ICON_CAMERA,
-    "VISION",
-    "MENU_VISION"
+    "VISION"
   },
   {
     BLIND_BADGE_MENU_VOICE,
     BLIND_BADGE_MENU_ICON_MICROPHONE,
-    "VOICE",
-    "MENU_VOICE"
+    "VOICE"
   },
   {
     BLIND_BADGE_MENU_HEALTH,
     BLIND_BADGE_MENU_ICON_HEART,
-    "HEALTH",
-    "MENU_HEALTH"
+    "HEALTH"
   },
   {
     BLIND_BADGE_MENU_ALERT,
     BLIND_BADGE_MENU_ICON_BELL,
-    "ALERT",
-    "MENU_ALERT"
+    "ALERT"
   },
   {
     BLIND_BADGE_MENU_SETTINGS,
     BLIND_BADGE_MENU_ICON_SETTINGS,
-    "SETTINGS",
-    "MENU_SETTINGS"
+    "SETTINGS"
   },
   {
     BLIND_BADGE_MENU_TEST,
     BLIND_BADGE_MENU_ICON_TEST,
-    "TEST",
-    NULL
+    "TEST"
   }
 };
 
 static size_t g_menu_selected;
 static enum blind_badge_menu_page g_menu_page;
 static bool g_menu_redraw_pending;
-static int g_menu_announced = -1;
 static bool g_speech_link_was_connected;
 static int g_speech_mode_sent = -1;
 static char g_menu_cached_state[BLIND_BADGE_MENU_STATE_SIZE];
@@ -110,6 +102,8 @@ static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
     "SPEECH_MODE_ALERT",
     "SPEECH_MODE_SILENT"
   };
+  char menu_flag[24];
+  const char *flag = flags[mode];
   bool connected = UART_LINK_IsConnected();
 
   if (!connected)
@@ -121,7 +115,6 @@ static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
 
   if (!g_speech_link_was_connected)
     {
-      g_menu_announced = -1;
       g_speech_mode_sent = -1;
       g_speech_link_was_connected = true;
     }
@@ -131,40 +124,48 @@ static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
       return 0;
     }
 
-  if (UART_LINK_SendFlag(flags[mode]) != 0)
+  /* A relative NEXT event is sufficient only after both boards agree on the
+   * current item.  Carry the absolute index in the one-time MENU mode sync;
+   * ordinary button presses remain a single BUTTON_MENU_NEXT message.
+   */
+
+  if (mode == BLIND_BADGE_SPEECH_MODE_MENU)
+    {
+      snprintf(menu_flag, sizeof(menu_flag), "SPEECH_MODE_MENU_%u",
+               (unsigned int)g_menu_selected);
+      flag = menu_flag;
+    }
+
+  if (UART_LINK_SendFlag(flag) != 0)
     {
       return -EIO;
     }
 
   g_speech_mode_sent = (int)mode;
-  return 0;
+  return 1;
 }
 
-static void menu_announce_selected(void)
+static void menu_announce_next(void)
 {
-  /* Announce the current item once after every link establishment and once
-   * after every real selection change.  LCD animation frames and ordinary
-   * redraws must not enqueue duplicate speech.
+  int sync_ret;
+
+  /* Menu labels are fixed and circular.  Send only the MENU button state;
+   * the sub-board advances its local pointer and speaks the next label.
    */
 
-  if (menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_MENU) < 0)
+  sync_ret = menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_MENU);
+  if (sync_ret < 0)
     {
       return;
     }
 
-  if (g_menu_announced == (int)g_menu_selected)
-    {
-      return;
-    }
+  /* A fresh/reconnected link has just received the absolute current index
+   * and must not advance a second time.
+   */
 
-  if (g_menu_items[g_menu_selected].speech_flag == NULL)
+  if (sync_ret == 0)
     {
-      g_menu_announced = (int)g_menu_selected;
-    }
-  else if (UART_LINK_SendFlag(
-             g_menu_items[g_menu_selected].speech_flag) == 0)
-    {
-      g_menu_announced = (int)g_menu_selected;
+      (void)UART_LINK_SendFlag("BUTTON_MENU_NEXT");
     }
 }
 
@@ -216,7 +217,7 @@ int blind_badge_menu_show(void)
                                       sizeof(g_menu_items) /
                                       sizeof(g_menu_items[0]),
                                       g_menu_selected);
-  menu_announce_selected();
+  (void)menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_MENU);
   return ret;
 }
 
@@ -254,6 +255,7 @@ int blind_badge_menu_next(void)
       g_menu_selected = 0;
     }
 
+  menu_announce_next();
   return ret < 0 ? ret : blind_badge_menu_show();
 }
 
@@ -308,7 +310,6 @@ int blind_badge_menu_leave(void)
       (void)blind_badge_service_stop();
       g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
       g_menu_redraw_pending = false;
-      g_menu_announced = -1;
       g_speech_mode_sent = -1;
       return blind_badge_menu_show();
     }
@@ -326,7 +327,7 @@ int blind_badge_menu_refresh(void)
           return blind_badge_menu_show();
         }
 
-      menu_announce_selected();
+      (void)menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_MENU);
       return 0;
     }
 
