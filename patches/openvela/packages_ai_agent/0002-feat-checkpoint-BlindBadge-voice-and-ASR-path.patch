@@ -1,0 +1,1874 @@
+From 6bd5cfc513f570e25758c828af7d8c556d882fe8 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Tue, 20 Oct 2026 10:21:09 +0800
+Subject: [PATCH 2/6] feat: checkpoint BlindBadge voice and ASR path
+
+---
+ docs/cli.md                 |   1 +
+ src/agent_main.c            | 143 ++++++++++++++-
+ src/channels/cmd_voice.c    |  29 ++-
+ src/channels/cmd_voice.h    |   3 +
+ src/channels/nsh_commands.c | 346 +++++++++++++++++++++++++++++++++++-
+ src/channels/nsh_commands.h |  10 ++
+ src/infra/network_manager.c | 208 +++++++++++-----------
+ src/infra/network_manager.h |   4 +
+ src/infra/vela_tls.c        |  53 +++++-
+ src/llm/llm_router.c        |  44 ++++-
+ src/llm/llm_router.h        |   7 +
+ src/voice/volc_asr.c        | 320 +++++++++++++++++++++++++++++----
+ 12 files changed, 1007 insertions(+), 161 deletions(-)
+
+diff --git a/docs/cli.md b/docs/cli.md
+index e99caeb..e5d3d8c 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -25,6 +25,7 @@ AI Agent 通过 NuttX NSH shell 提供以下命令。启动后输入 `help` 查
+ |------|------|
+ | `router_status` | 显示路由状态（后端列表、指标、当前 profile） |
+ | `router_set <preset> <key>` | 添加/更新 LLM 后端 |
++| `router_import_mimo [path]` | 从本地 key 文件导入 MiMo 后端，默认读取 `/data/agent/config/mimo.key` |
+ | `router_model <idx> <model>` | 修改指定后端的模型 |
+ | `router_profile <p>` | 设置路由策略（eco/auto/premium） |
+ | `router_clear [idx]` | 清除路由后端（不指定 idx 则清除全部） |
+diff --git a/src/agent_main.c b/src/agent_main.c
+index 76494e9..edb8698 100644
+--- a/src/agent_main.c
++++ b/src/agent_main.c
+@@ -80,6 +80,22 @@
+ 
+ static const char* TAG = "agent";
+ 
++#if defined(__has_include)
++#  if __has_include("channels/ai_agent_local_secrets.h")
++#    include "channels/ai_agent_local_secrets.h"
++#  endif
++#endif
++
++#ifndef AI_AGENT_LOCAL_MIMO_KEY
++#  define AI_AGENT_LOCAL_MIMO_KEY ""
++#endif
++#ifndef AI_AGENT_LOCAL_WIFI_SSID
++#  define AI_AGENT_LOCAL_WIFI_SSID ""
++#endif
++#ifndef AI_AGENT_LOCAL_WIFI_PASSWORD
++#  define AI_AGENT_LOCAL_WIFI_PASSWORD ""
++#endif
++
+ /* ── stdout mutex — shared with nsh_commands.c ──────────────── */
+ /* Prevents concurrent printf from outbound_dispatch_task and cli_thread
+  * which causes adbd shell_service_uv assert (wait_ack != 0). */
+@@ -89,6 +105,7 @@ pthread_mutex_t g_stdout_lock = PTHREAD_MUTEX_INITIALIZER;
+ /* Set by cmd_quit via agent_request_shutdown(); checked by main loop
+  * to trigger graceful teardown instead of calling exit(). */
+ static volatile bool g_shutdown_requested = false;
++static volatile bool g_agent_running = false;
+ 
+ void agent_request_shutdown(void)
+ {
+@@ -100,6 +117,38 @@ bool agent_shutdown_requested(void)
+     return g_shutdown_requested;
+ }
+ 
++static void configure_local_mimo_fallback(void)
++{
++    llm_backend_t current;
++
++    for (int i = 0; i < LLM_ROUTER_MAX_BACKENDS; i++) {
++        if (llm_router_get_backend(i, &current) == OK) {
++            return;
++        }
++    }
++
++    if (AI_AGENT_LOCAL_MIMO_KEY[0] == '\0') {
++        return;
++    }
++
++    llm_backend_t backend = { 0 };
++    strncpy(backend.host, AGENT_LLM_MIMO_HOST, sizeof(backend.host) - 1);
++    strncpy(backend.path, AGENT_LLM_MIMO_PATH, sizeof(backend.path) - 1);
++    strncpy(backend.port, "443", sizeof(backend.port) - 1);
++    strncpy(backend.model, AGENT_LLM_MIMO_MODEL, sizeof(backend.model) - 1);
++    strncpy(backend.api_key, AI_AGENT_LOCAL_MIMO_KEY,
++        sizeof(backend.api_key) - 1);
++    backend.priority = 0;
++    backend.cost_tier = 1;
++    backend.enabled = true;
++
++    if (llm_router_set_backend_runtime(0, &backend) == OK) {
++        syslog(LOG_INFO, "[%s] Local MiMo fallback enabled\n", TAG);
++    }
++
++    memset(&backend, 0, sizeof(backend));
++}
++
+ /* ── Network watcher (async) ──────────────────────────────────── */
+ 
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+@@ -342,10 +391,12 @@ static inline long boot_ms(struct timespec* t0)
+ 
+ int ai_agent_main(int argc, char* argv[])
+ {
+-    (void)argc;
+-    (void)argv;
++    bool daemon_mode = argc == 2 && strcmp(argv[1], "--daemon") == 0;
++    bool direct_mode = argc > 1 && !daemon_mode;
+ 
+-    g_shutdown_requested = false;
++    if (!direct_mode) {
++        g_shutdown_requested = false;
++    }
+ 
+     struct timespec t0;
+     clock_gettime(CLOCK_MONOTONIC, &t0);
+@@ -386,6 +437,85 @@ int ai_agent_main(int argc, char* argv[])
+             TAG, boot_ms(&t0), mi.arena, mi.fordblks, mi.uordblks);
+     }
+ 
++    /* These direct commands only use process-local state. */
++    if (direct_mode
++        && (strcmp(argv[1], "help") == 0
++            || strcmp(argv[1], "heap_info") == 0
++            || strcmp(argv[1], "key_clear") == 0
++            || strcmp(argv[1], "key_add") == 0)) {
++        return nsh_commands_run(argc - 1, &argv[1]);
++    }
++
++    /* Board startup uses a small network/config daemon.  The full Agent
++     * service set is intentionally not started here: some ESP32-S3 channel
++     * combinations can block the native USB ACM transmit path. */
++    if (daemon_mode) {
++        int rc;
++
++        /* rcS launches this task before NSH finishes bringing up its console.
++         * Give the startup shell time to release the console before Wi-Fi
++         * commands create short-lived NSH tasks via system(). */
++        sleep(5);
++
++        rc = config_store_init();
++        BOOT_LOG_RC(&t0, "P1-daemon", "config_store_init", rc);
++
++        rc = http_proxy_init();
++        BOOT_LOG_RC(&t0, "P2-daemon", "http_proxy_init", rc);
++
++        rc = llm_proxy_init();
++        BOOT_LOG_RC(&t0, "P3-daemon", "llm_proxy_init", rc);
++
++        rc = llm_router_init();
++        BOOT_LOG_RC(&t0, "P3-daemon", "llm_router_init", rc);
++        configure_local_mimo_fallback();
++
++        syslog(LOG_INFO,
++            "[%s] Boot daemon ready; monitoring saved WiFi configuration\n",
++            TAG);
++
++        while (!g_shutdown_requested) {
++            if (!network_is_connected()) {
++                rc = network_wifi_reconnect();
++                if (rc != OK && AI_AGENT_LOCAL_WIFI_SSID[0] != '\0') {
++                    syslog(LOG_INFO,
++                        "[%s] Connecting with local WiFi fallback\n", TAG);
++                    network_wifi_connect(NULL, AI_AGENT_LOCAL_WIFI_SSID,
++                        AI_AGENT_LOCAL_WIFI_PASSWORD);
++                }
++            }
++            sleep(30);
++        }
++
++        return OK;
++    }
++
++    /* Other direct NSH commands are short-lived. Initialize only the state
++     * they use so long-lived Agent subsystems are not left behind. */
++    if (direct_mode) {
++        int rc;
++
++        if (!g_agent_running) {
++            rc = config_store_init();
++            BOOT_LOG_RC(&t0, "P1-direct", "config_store_init", rc);
++
++            rc = http_proxy_init();
++            BOOT_LOG_RC(&t0, "P2-direct", "http_proxy_init", rc);
++
++            rc = llm_proxy_init();
++            BOOT_LOG_RC(&t0, "P3-direct", "llm_proxy_init", rc);
++
++            rc = llm_router_init();
++            BOOT_LOG_RC(&t0, "P3-direct", "llm_router_init", rc);
++            configure_local_mimo_fallback();
++
++            rc = nsh_commands_init();
++            BOOT_LOG_RC(&t0, "P4-direct", "nsh_commands_init", rc);
++        }
++
++        return nsh_commands_run(argc - 1, &argv[1]);
++    }
++
+     /* ── Phase 1: Core infrastructure ──────────────────────── */
+     {
+         int rc;
+@@ -423,6 +553,7 @@ int ai_agent_main(int argc, char* argv[])
+ 
+         rc = llm_router_init();
+         BOOT_LOG_RC(&t0, "P3", "llm_router_init", rc);
++        configure_local_mimo_fallback();
+ 
+         /* node_manager must init BEFORE tool_registry so it can
+          * register itself as a tool provider. */
+@@ -480,6 +611,7 @@ int ai_agent_main(int argc, char* argv[])
+         int rc = nsh_commands_init();
+         BOOT_LOG_RC(&t0, "P4", "nsh_commands_init", rc);
+     }
++    g_agent_running = true;
+ 
+     /* ── Phase 5: Network — async, does NOT block ready ────── */
+ 
+@@ -519,9 +651,11 @@ int ai_agent_main(int argc, char* argv[])
+     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
+ 
+     /* ── Phase 6: CLI thread — all services now in known state ── */
+-    {
++    if (!daemon_mode) {
+         int rc = nsh_commands_start();
+         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
++    } else {
++        BOOT_LOG(&t0, "P6", "daemon mode; NSH input left untouched");
+     }
+ 
+     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
+@@ -533,6 +667,7 @@ int ai_agent_main(int argc, char* argv[])
+     }
+ 
+     syslog(LOG_INFO, "[%s] Shutdown requested — stopping services...\n", TAG);
++    g_agent_running = false;
+ 
+     /* Wake all threads blocked on message bus before stopping services */
+     message_bus_wakeup();
+diff --git a/src/channels/cmd_voice.c b/src/channels/cmd_voice.c
+index 7eb5a1f..08b4698 100644
+--- a/src/channels/cmd_voice.c
++++ b/src/channels/cmd_voice.c
+@@ -21,6 +21,7 @@
+ #include "voice/voice_asr.h"
+ #include "voice/voice_channel.h"
+ #include "voice/voice_tts.h"
++#include "voice/volc_asr.h"
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -48,7 +49,7 @@ void cmd_set_volc_speaker(int argc, char** argv)
+ void cmd_set_volc_asr(int argc, char** argv)
+ {
+     if (argc < 4) {
+-        printf("Usage: set_volc_asr <app_id> <token> <cluster>\n");
++        printf("Usage: set_volc_asr <app_id> <token> <cluster_or_resource_id>\n");
+         return;
+     }
+     claw_config_set(AGENT_CFG_KEY_VOLC_APPKEY, argv[1]);
+@@ -58,6 +59,27 @@ void cmd_set_volc_asr(int argc, char** argv)
+         argv[1], argv[3]);
+ }
+ 
++void cmd_set_volc_asr_app(int argc, char** argv)
++{
++    if (argc < 2) { printf("Usage: set_asr_app <id>\n"); return; }
++    claw_config_set(AGENT_CFG_KEY_VOLC_APPKEY, argv[1]);
++    printf("ASR app id saved.\n");
++}
++
++void cmd_set_volc_asr_tok(int argc, char** argv)
++{
++    if (argc < 2) { printf("Usage: set_asr_tok <token>\n"); return; }
++    claw_config_set(AGENT_CFG_KEY_VOLC_TOKEN, argv[1]);
++    printf("ASR token saved.\n");
++}
++
++void cmd_set_volc_asr_clu(int argc, char** argv)
++{
++    if (argc < 2) { printf("Usage: set_asr_clu <cluster>\n"); return; }
++    claw_config_set(AGENT_CFG_KEY_VOLC_ASR_CLUSTER, argv[1]);
++    printf("ASR cluster saved.\n");
++}
++
+ void cmd_voice_start(void)
+ {
+     voice_channel_start();
+@@ -122,6 +144,11 @@ void cmd_set_voice_asr(int argc, char** argv)
+         return;
+     }
+ 
++    /* Register built-in backends before selecting one.  The direct
++     * ai_agent command may be used before voice_channel_init(). */
++    /* Register ASR directly; full voice channel init may fail when the
++     * board audio device is unavailable, but file/PCM ASR is still usable. */
++    volc_asr_register();
+     int ret = voice_asr_set_backend(argv[1]);
+ 
+     if (ret == 0) {
+diff --git a/src/channels/cmd_voice.h b/src/channels/cmd_voice.h
+index a9a00b9..e391b94 100644
+--- a/src/channels/cmd_voice.h
++++ b/src/channels/cmd_voice.h
+@@ -19,6 +19,9 @@
+ void cmd_set_volc_key(int argc, char** argv);
+ void cmd_set_volc_speaker(int argc, char** argv);
+ void cmd_set_volc_asr(int argc, char** argv);
++void cmd_set_volc_asr_app(int argc, char** argv);
++void cmd_set_volc_asr_tok(int argc, char** argv);
++void cmd_set_volc_asr_clu(int argc, char** argv);
+ void cmd_voice_start(void);
+ void cmd_voice_stop(void);
+ void cmd_voice_test_tts(int argc, char** argv);
+diff --git a/src/channels/nsh_commands.c b/src/channels/nsh_commands.c
+index f750c4e..22cb9af 100644
+--- a/src/channels/nsh_commands.c
++++ b/src/channels/nsh_commands.c
+@@ -41,6 +41,7 @@
+ #include "tools/tool_proxyquickapp.h"
+ #include "tools/tool_registry.h"
+ #include "tools/tool_web_search.h"
++#include "llm/llm_router.h"
+ #include "agent_compat.h"
+ #include "agent_config.h"
+ 
+@@ -65,6 +66,11 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++#if defined(CONFIG_NETDB_DNSCLIENT) && !defined(CONFIG_AI_AGENT_NET_RPMSG)
++#include <arpa/inet.h>
++#include <netutils/netlib.h>
++#endif
++
+ #ifdef CONFIG_BOARDCTL_RESET
+ #include <sys/boardctl.h>
+ #endif
+@@ -74,6 +80,33 @@ static const char* TAG = "cli";
+ #define MAX_ARGS 8
+ #define LINE_LEN 256
+ 
++static char g_direct_api_key[160];
++
++/* Product UIs may provide this optional hook.  Keeping it weak preserves the
++ * standalone ai_agent build while allowing direct `ask` replies on an LCD. */
++extern void ai_agent_display_ask_result(const char* response, int success)
++    __attribute__((weak));
++
++#if defined(__has_include)
++#  if __has_include("ai_agent_local_secrets.h")
++#    include "ai_agent_local_secrets.h"
++#  endif
++#endif
++
++#ifndef AI_AGENT_LOCAL_MIMO_KEY
++#  define AI_AGENT_LOCAL_MIMO_KEY ""
++#endif
++
++#ifndef AI_AGENT_LOCAL_WIFI_SSID
++#  define AI_AGENT_LOCAL_WIFI_SSID ""
++#endif
++
++#ifndef AI_AGENT_LOCAL_WIFI_PASSWORD
++#  define AI_AGENT_LOCAL_WIFI_PASSWORD ""
++#endif
++
++#define MIMO_KEY_FILE AGENT_CONFIG_DIR "/mimo.key"
++
+ /* ── Helpers ──────────────────────────────────────────────────── */
+ 
+ static int tokenise(char* line, char** argv, int max_argc)
+@@ -107,6 +140,9 @@ static void cmd_help(void)
+         "  clear_proxy          - Remove proxy config\n"
+         "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
+         "  wifi_reconnect       - Re-join WiFi using saved credentials\n"
++#if defined(CONFIG_NETDB_DNSCLIENT) && !defined(CONFIG_AI_AGENT_NET_RPMSG)
++        "  set_dns <server>     - Set runtime DNS without reconnecting WiFi\n"
++#endif
+         "  set_search_key <key> - Set SerpAPI (Google) key\n"
+         "  set_exa_key <key>    - Set Exa AI search key\n"
+         "  set_tavily_key <key> - Set Tavily search key\n"
+@@ -139,9 +175,13 @@ static void cmd_help(void)
+         "  weixin_login           - QR code login to WeChat\n"
+         "  router_status          - Show LLM router status\n"
+         "  router_set <preset> <key> - Add LLM backend (deepseek/kimi/qwen/openai...)\n"
++        "  router_import_mimo [path] - Import MiMo key from local key file\n"
+         "  router_model <idx> <model> - Change model for a backend\n"
+         "  router_profile <p>     - Set routing profile (eco/auto/premium)\n"
+         "  router_clear [idx]     - Clear router backends\n"
++        "  key_clear            - Clear temporary API key buffer\n"
++        "  key_add <chunk>      - Append to temporary API key buffer\n"
++        "  router_set_key <preset> - Add backend using temporary API key\n"
+         "  launch_app <pkg>     - Test launch a QuickApp by package name\n"
+         "  exit_app             - Exit current QuickApp and go home\n"
+         "  install_skill <name> <url|-> - Install skill from URL or stdin\n"
+@@ -339,14 +379,33 @@ static void cmd_set_wifi(int argc, char** argv)
+         printf("WiFi failed. Check SSID/password or run net_status.\n");
+ }
+ 
++int ai_agent_wifi_reconnect(void)
++{
++    int err;
++
++    /* A build-local configuration is the authoritative boot configuration.
++     * Trying stale persisted credentials first can double the boot timeout. */
++    if (AI_AGENT_LOCAL_WIFI_SSID[0] != '\0') {
++        return network_wifi_connect_boot(NULL, AI_AGENT_LOCAL_WIFI_SSID,
++            AI_AGENT_LOCAL_WIFI_PASSWORD);
++    }
++
++    /* Persisted credentials require the config store.  Keep this off the
++     * compile-time local credential path so physical reset can start Wi-Fi
++     * immediately even when storage initialization is slow. */
++    config_store_init();
++    err = network_wifi_reconnect();
++    return err;
++}
++
+ static void cmd_wifi_reconnect(void)
+ {
+     printf("Reconnecting WiFi ...\n");
+-    int err = network_wifi_reconnect();
++    int err = ai_agent_wifi_reconnect();
+     if (err == OK)
+         printf("Reconnected: %s\n", network_get_ip());
+     else if (err == ERROR)
+-        printf("No saved credentials. Use: set_wifi <ssid> <pass>\n");
++        printf("WiFi reconnect failed. Check local or saved credentials.\n");
+     else
+         printf("WiFi reconnect failed.\n");
+ }
+@@ -394,6 +453,24 @@ static void cmd_set_dns(int argc, char** argv)
+         printf("Failed to set DNS: %d\n", ret);
+     }
+ }
++#elif defined(CONFIG_NETDB_DNSCLIENT)
++static void cmd_set_dns(int argc, char** argv)
++{
++    struct in_addr address;
++
++    if (argc != 2 || inet_pton(AF_INET, argv[1], &address) != 1
++        || address.s_addr == INADDR_ANY) {
++        printf("Usage: set_dns <IPv4_server>\n");
++        return;
++    }
++
++    int ret = netlib_set_ipv4dnsaddr(&address);
++    if (ret == OK) {
++        printf("DNS configured: %s\n", argv[1]);
++    } else {
++        printf("Failed to set DNS: %d\n", ret);
++    }
++}
+ #endif
+ 
+ static void cmd_set_search_key(int argc, char** argv)
+@@ -547,6 +624,62 @@ static void cmd_ask(int argc, char** argv)
+     syslog(LOG_INFO, "[agent] ask: %s\n", content);
+ }
+ 
++static void cmd_ask_direct(int argc, char** argv)
++{
++    if (argc < 2) {
++        printf("Usage: ask <message>\n");
++        return;
++    }
++
++    char content[256] = { 0 };
++    for (int i = 1; i < argc; i++) {
++        strncat(content, argv[i], sizeof(content) - strlen(content) - 1);
++        if (i < argc - 1)
++            strncat(content, " ", sizeof(content) - strlen(content) - 1);
++    }
++
++    int idx = llm_router_select(LLM_COMPLEXITY_SIMPLE);
++    if (idx < 0 || llm_router_apply(idx) != 0) {
++        printf("Error: no available LLM router backend\n");
++        if (ai_agent_display_ask_result) {
++            ai_agent_display_ask_result("No AI backend", 0);
++        }
++        return;
++    }
++
++    char messages_json[384];
++    char response[512] = { 0 };
++    struct timespec t0;
++    struct timespec t1;
++
++    snprintf(messages_json, sizeof(messages_json),
++        "[{\"role\":\"user\",\"content\":\"%s\"}]", content);
++
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++    int rc = llm_chat("You are a concise assistant. Reply briefly.",
++        messages_json, response, sizeof(response));
++    clock_gettime(CLOCK_MONOTONIC, &t1);
++
++    uint32_t latency_ms = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000L
++        + (t1.tv_nsec - t0.tv_nsec) / 1000000L);
++
++    if (rc == OK) {
++        llm_router_report_success(idx);
++        llm_router_report_latency(idx, latency_ms);
++        printf("%s\n", response);
++        if (ai_agent_display_ask_result) {
++            ai_agent_display_ask_result(response, 1);
++        }
++    } else {
++        const char* error = response[0] ? response : "Error: llm_chat failed";
++        llm_router_report_failure(idx);
++        printf("%s\n", error);
++        if (ai_agent_display_ask_result) {
++            ai_agent_display_ask_result(error, 0);
++        }
++    }
++}
++
+ static void cmd_cron_start(void)
+ {
+     if (cron_service_start() == OK) {
+@@ -615,6 +748,130 @@ static void cmd_quit(void)
+     agent_request_shutdown();
+ }
+ 
++static void cmd_key_clear(void)
++{
++    g_direct_api_key[0] = '\0';
++    printf("Temporary API key buffer cleared.\n");
++}
++
++static void cmd_key_add(int argc, char** argv)
++{
++    if (argc < 2) {
++        printf("Usage: key_add <chunk>\n");
++        return;
++    }
++
++    size_t used = strlen(g_direct_api_key);
++    size_t chunk = strlen(argv[1]);
++
++    if (used + chunk >= sizeof(g_direct_api_key)) {
++        printf("Temporary API key buffer full.\n");
++        return;
++    }
++
++    memcpy(g_direct_api_key + used, argv[1], chunk + 1);
++    printf("Temporary API key buffer length: %zu\n", used + chunk);
++}
++
++static void cmd_router_set_key(int argc, char** argv)
++{
++    if (argc < 2) {
++        printf("Usage: router_set_key <preset>\n");
++        return;
++    }
++
++    if (g_direct_api_key[0] == '\0') {
++        printf("Temporary API key buffer is empty. Use key_add first.\n");
++        return;
++    }
++
++    char* set_argv[] = {
++        "router_set",
++        argv[1],
++        g_direct_api_key,
++    };
++
++    cmd_router_set(3, set_argv);
++}
++
++static void trim_secret(char* text)
++{
++    size_t len;
++
++    if (text == NULL) {
++        return;
++    }
++
++    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
++        memmove(text, text + 1, strlen(text));
++    }
++
++    len = strlen(text);
++    while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t'
++           || text[len - 1] == '\r' || text[len - 1] == '\n')) {
++        text[--len] = '\0';
++    }
++}
++
++static int read_secret_file(const char* path, char* out, size_t out_size)
++{
++    FILE* f;
++    size_t n;
++
++    if (path == NULL || out == NULL || out_size == 0) {
++        return ERROR;
++    }
++
++    f = fopen(path, "r");
++    if (f == NULL) {
++        return ERROR;
++    }
++
++    n = fread(out, 1, out_size - 1, f);
++    fclose(f);
++
++    out[n] = '\0';
++    trim_secret(out);
++    return out[0] != '\0' ? OK : ERROR;
++}
++
++static void cmd_router_import_mimo(int argc, char** argv)
++{
++    const char* path = argc >= 2 ? argv[1] : MIMO_KEY_FILE;
++    char key[128] = { 0 };
++
++    if (read_secret_file(path, key, sizeof(key)) != OK) {
++        snprintf(key, sizeof(key), "%s", AI_AGENT_LOCAL_MIMO_KEY);
++        trim_secret(key);
++    }
++
++    if (key[0] == '\0') {
++        printf("MiMo key not found. Put it in %s or provide a local untracked ai_agent_local_secrets.h.\n",
++               path);
++        return;
++    }
++
++    llm_backend_t backend = { 0 };
++    strncpy(backend.host, AGENT_LLM_MIMO_HOST, sizeof(backend.host) - 1);
++    strncpy(backend.path, AGENT_LLM_MIMO_PATH, sizeof(backend.path) - 1);
++    strncpy(backend.port, "443", sizeof(backend.port) - 1);
++    strncpy(backend.model, AGENT_LLM_MIMO_MODEL, sizeof(backend.model) - 1);
++    strncpy(backend.api_key, key, sizeof(backend.api_key) - 1);
++    backend.priority = 0;
++    backend.cost_tier = 1;
++    backend.enabled = true;
++
++    if (llm_router_set_backend_runtime(0, &backend) == 0) {
++        printf("Imported [0]: mimo (%s, tier=%d, runtime)\n",
++            backend.model, backend.cost_tier);
++    } else {
++        printf("Failed to import MiMo backend.\n");
++    }
++
++    memset(key, 0, sizeof(key));
++    memset(&backend, 0, sizeof(backend));
++}
++
+ static void cmd_launch_app(int argc, char** argv)
+ {
+     if (argc < 2) {
+@@ -905,6 +1162,8 @@ static void* cli_thread(void* arg)
+             cmd_net_reconnect();
+         else if (strcmp(cmd, "set_netproxy") == 0)
+             cmd_set_netproxy(argc, argv);
++#endif
++#if defined(CONFIG_AI_AGENT_NET_RPMSG) || defined(CONFIG_NETDB_DNSCLIENT)
+         else if (strcmp(cmd, "set_dns") == 0)
+             cmd_set_dns(argc, argv);
+ #endif
+@@ -997,6 +1256,8 @@ static void* cli_thread(void* arg)
+             cmd_router_status();
+         else if (strcmp(cmd, "router_set") == 0)
+             cmd_router_set(argc, argv);
++        else if (strcmp(cmd, "router_import_mimo") == 0)
++            cmd_router_import_mimo(argc, argv);
+         else if (strcmp(cmd, "router_model") == 0)
+             cmd_router_model(argc, argv);
+         else if (strcmp(cmd, "router_profile") == 0)
+@@ -1031,5 +1292,84 @@ int nsh_commands_init(void)
+ 
+ int nsh_commands_start(void)
+ {
+-    return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
++    cli_thread(NULL);
++    return OK;
++}
++
++int nsh_commands_run(int argc, char** argv)
++{
++    if (argc <= 0 || argv == NULL || argv[0] == NULL) {
++        cmd_help();
++        return OK;
++    }
++
++    const char* cmd = argv[0];
++
++    if (strcmp(cmd, "help") == 0)
++        cmd_help();
++    else if (strcmp(cmd, "net_status") == 0)
++        cmd_net_status();
++    else if (strcmp(cmd, "net_test") == 0)
++        cmd_net_test();
++    else if (strcmp(cmd, "heap_info") == 0)
++        cmd_heap_info();
++    else if (strcmp(cmd, "set_wifi") == 0)
++        cmd_set_wifi(argc, argv);
++    else if (strcmp(cmd, "wifi_reconnect") == 0)
++        cmd_wifi_reconnect();
++#if defined(CONFIG_AI_AGENT_NET_RPMSG) || defined(CONFIG_NETDB_DNSCLIENT)
++    else if (strcmp(cmd, "set_dns") == 0)
++        cmd_set_dns(argc, argv);
++#endif
++    else if (strcmp(cmd, "router_status") == 0)
++        cmd_router_status();
++    else if (strcmp(cmd, "router_set") == 0)
++        cmd_router_set(argc, argv);
++    else if (strcmp(cmd, "router_import_mimo") == 0)
++        cmd_router_import_mimo(argc, argv);
++    else if (strcmp(cmd, "router_model") == 0)
++        cmd_router_model(argc, argv);
++    else if (strcmp(cmd, "router_profile") == 0)
++        cmd_router_profile(argc, argv);
++    else if (strcmp(cmd, "router_clear") == 0)
++        cmd_router_clear(argc, argv);
++    else if (strcmp(cmd, "key_clear") == 0)
++        cmd_key_clear();
++    else if (strcmp(cmd, "key_add") == 0)
++        cmd_key_add(argc, argv);
++    else if (strcmp(cmd, "router_set_key") == 0)
++        cmd_router_set_key(argc, argv);
++    else if (strcmp(cmd, "config_show") == 0)
++        cmd_config_show();
++    else if (strcmp(cmd, "ask") == 0)
++        cmd_ask_direct(argc, argv);
++    else if (strcmp(cmd, "set_volc_key") == 0)
++        cmd_set_volc_key(argc, argv);
++    else if (strcmp(cmd, "set_volc_asr") == 0)
++        cmd_set_volc_asr(argc, argv);
++    else if (strcmp(cmd, "set_asr_app") == 0)
++        cmd_set_volc_asr_app(argc, argv);
++    else if (strcmp(cmd, "set_asr_tok") == 0)
++        cmd_set_volc_asr_tok(argc, argv);
++    else if (strcmp(cmd, "set_asr_clu") == 0)
++        cmd_set_volc_asr_clu(argc, argv);
++    else if (strcmp(cmd, "set_voice_asr") == 0)
++        cmd_set_voice_asr(argc, argv);
++    else if (strcmp(cmd, "voice_test_asr") == 0)
++        cmd_voice_test_asr(argc, argv);
++    else if (strcmp(cmd, "quit") == 0)
++        cmd_quit();
++    else {
++        printf("Unknown command: %s (supported direct commands: help, "
++               "net_status, net_test, heap_info, set_wifi, wifi_reconnect, "
++               "router_status, router_set, "
++               "router_import_mimo, router_model, router_profile, router_clear, key_clear, "
++               "key_add, router_set_key, config_show, ask, set_volc_asr, set_voice_asr, "
++               "voice_test_asr)\n",
++               cmd);
++        return ERROR;
++    }
++
++    fflush(stdout);
++    return OK;
+ }
+diff --git a/src/channels/nsh_commands.h b/src/channels/nsh_commands.h
+index d3dc74e..9622e58 100644
+--- a/src/channels/nsh_commands.h
++++ b/src/channels/nsh_commands.h
+@@ -40,3 +40,13 @@ int nsh_commands_init(void);
+  * Call after all services are in a known state (post Phase 5).
+  */
+ int nsh_commands_start(void);
++
++/**
++ * Run one CLI command directly from argv.
++ * Useful for boards where a foreground builtin cannot reliably read stdin
++ * from the spawned agent CLI loop.
++ */
++int nsh_commands_run(int argc, char** argv);
++
++/** Reconnect using saved credentials, then compile-time local fallback. */
++int ai_agent_wifi_reconnect(void);
+diff --git a/src/infra/network_manager.c b/src/infra/network_manager.c
+index 00cc296..71768df 100644
+--- a/src/infra/network_manager.c
++++ b/src/infra/network_manager.c
+@@ -19,19 +19,30 @@
+ 
+ #include <arpa/inet.h>
+ #include <ifaddrs.h>
++#include <net/if.h>
+ #include <netinet/in.h>
++#include <netutils/netlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
++#ifdef CONFIG_WIRELESS_WAPI
++#include <wireless/wapi.h>
++#endif
++
+ static const char* TAG = "netmgr";
+ 
+ static char s_ip_str[INET_ADDRSTRLEN] = "0.0.0.0";
++/* WAPI configuration and DHCP are not safe to run concurrently.  The
++ * startup agent and BlindBadge both may request a reconnect after reset. */
++static pthread_mutex_t s_wifi_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ bool network_is_connected(void)
+ {
++    strlcpy(s_ip_str, "0.0.0.0", sizeof(s_ip_str));
++
+     struct ifaddrs* ifa_list = NULL;
+     if (getifaddrs(&ifa_list) == 0) {
+         for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+@@ -41,7 +52,15 @@ bool network_is_connected(void)
+                 continue;
+             if (ifa->ifa_name && strncmp(ifa->ifa_name, "lo", 2) == 0)
+                 continue;
+-
++#ifdef CONFIG_ARCH_CHIP_ESP32S3
++            /* A stale IPv4 address must not count as Wi-Fi connectivity after
++             * the STA carrier has dropped. */
++            if (!ifa->ifa_name || strcmp(ifa->ifa_name, "wlan0") != 0)
++                continue;
++            if ((ifa->ifa_flags & (IFF_UP | IFF_RUNNING)) !=
++                (IFF_UP | IFF_RUNNING))
++                continue;
++#endif
+             struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+             uint32_t addr = ntohl(sin->sin_addr.s_addr);
+             if ((addr >> 24) == 127)
+@@ -52,8 +71,6 @@ bool network_is_connected(void)
+                 continue;
+ 
+             inet_ntop(AF_INET, &sin->sin_addr, s_ip_str, sizeof(s_ip_str));
+-            syslog(LOG_INFO, "[%s] Found iface %s addr %s\n", TAG,
+-                ifa->ifa_name ? ifa->ifa_name : "?", s_ip_str);
+             freeifaddrs(ifa_list);
+             return true;
+         }
+@@ -80,14 +97,12 @@ int network_wait_connected(uint32_t timeout_ms)
+ 
+     while (1) {
+         if (network_is_connected()) {
+-            syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, s_ip_str);
+             return OK;
+         }
+ 
+         struct timespec now;
+         clock_gettime(CLOCK_REALTIME, &now);
+         if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+-            syslog(LOG_WARNING, "[%s] Timed out waiting for network\n", TAG);
+             return ERROR;
+         }
+ 
+@@ -122,6 +137,12 @@ int network_wifi_connect(const char* iface, const char* ssid,
+     return OK;
+ }
+ 
++int network_wifi_connect_boot(const char* iface, const char* ssid,
++    const char* pass)
++{
++    return network_wifi_connect(iface, ssid, pass);
++}
++
+ int network_wifi_reconnect(void)
+ {
+     syslog(LOG_INFO, "[%s] QEMU: Initializing eth0...\n", TAG);
+@@ -758,6 +779,12 @@ int network_wifi_connect(const char* iface, const char* ssid,
+     return network_rpmsg_init();
+ }
+ 
++int network_wifi_connect_boot(const char* iface, const char* ssid,
++    const char* pass)
++{
++    return network_wifi_connect(iface, ssid, pass);
++}
++
+ int network_wifi_reconnect(void)
+ {
+     syslog(LOG_INFO,
+@@ -766,126 +793,89 @@ int network_wifi_reconnect(void)
+ }
+ 
+ #else
+-/* Real hardware: use NuttX wapi shell command to join WiFi */
++/* Real hardware: use the board-supported NuttX WAPI command sequence. */
+ #include "infra/config_store.h"
+ #include "agent_config.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-/*
+- * Wrap src in single quotes for safe use inside a system() shell command.
+- * Every embedded ' is replaced by the sequence '\'' so arbitrary SSID/PSK
+- * strings (spaces, semicolons, ampersands, etc.) cannot break the command.
+- * Returns 0 on success, -1 if buf is too small.
+- */
+-static int shell_quote(const char* src, char* buf, size_t buf_size)
+-{
+-    size_t out = 0;
+-    if (buf_size < 3) return -1; /* need at least '' + NUL */
+-    buf[out++] = '\'';
+-    for (const char* p = src; *p; p++) {
+-        if (*p == '\'') {
+-            if (out + 4 >= buf_size) return -1;
+-            buf[out++] = '\'';
+-            buf[out++] = '\\';
+-            buf[out++] = '\'';
+-            buf[out++] = '\'';
+-        } else {
+-            if (out + 1 >= buf_size) return -1;
+-            buf[out++] = *p;
+-        }
+-    }
+-    if (out + 1 >= buf_size) return -1;
+-    buf[out++] = '\'';
+-    buf[out]   = '\0';
+-    return 0;
+-}
+-
+-int network_wifi_connect(const char* iface, const char* ssid,
+-    const char* pass)
++static int network_wifi_connect_impl(const char* iface, const char* ssid,
++    const char* pass, bool persist)
+ {
+-    if (!ssid || ssid[0] == '\0') {
+-        syslog(LOG_ERR, "[%s] wifi_connect: SSID required\n", TAG);
++    const char* dev = (iface && iface[0]) ? iface : "wlan0";
++    size_t ssid_len = ssid ? strlen(ssid) : 0;
++    size_t pass_len = pass ? strlen(pass) : 0;
++    int sock;
++    int ret;
++
++    if (!ssid || !ssid[0] || ssid_len > WAPI_ESSID_MAX_SIZE
++        || (pass_len > 0 && (pass_len < 8 || pass_len > 63)))
+         return ERROR;
+-    }
+ 
+-    const char* dev = (iface && iface[0]) ? iface : "wlan0";
+-    char cmd[512];
++    if (netlib_ifup(dev) != OK)
++        return ERROR;
++    struct in_addr no_addr = { .s_addr = INADDR_ANY };
++    netlib_set_ipv4addr(dev, &no_addr);
++    netlib_set_dripv4addr(dev, &no_addr);
++    netlib_set_ipv4netmask(dev, &no_addr);
++    usleep(500000);
+ 
+-    /* P2: single-quote ssid/pass so spaces and shell metacharacters in
+-     * Wi-Fi credentials cannot break or inject into the wapi commands. */
+-    char q_ssid[192], q_pass[384];
+-    if (shell_quote(ssid, q_ssid, sizeof(q_ssid)) != 0) {
+-        syslog(LOG_ERR, "[%s] wifi_connect: SSID too long or unquotable\n", TAG);
++    sock = wapi_make_socket();
++    if (sock < 0)
+         return ERROR;
+-    }
+-    if (pass && pass[0] && shell_quote(pass, q_pass, sizeof(q_pass)) != 0) {
+-        syslog(LOG_ERR, "[%s] wifi_connect: PSK too long or unquotable\n", TAG);
++    ret = wapi_set_mode(sock, dev, WAPI_MODE_MANAGED);
++    if (ret == OK)
++        ret = wpa_driver_wext_set_auth_param(sock, dev,
++            IW_AUTH_WPA_VERSION,
++            pass_len > 0 ? IW_AUTH_WPA_VERSION_WPA2
++                         : IW_AUTH_WPA_VERSION_DISABLED);
++    if (ret == OK)
++        ret = wpa_driver_wext_set_auth_param(sock, dev,
++            IW_AUTH_CIPHER_PAIRWISE,
++            pass_len > 0 ? IW_AUTH_CIPHER_CCMP : IW_AUTH_CIPHER_NONE);
++    if (ret == OK && pass_len > 0)
++        ret = wpa_driver_wext_set_key_ext(sock, dev, WPA_ALG_CCMP,
++            pass, pass_len);
++    if (ret == OK)
++        ret = wapi_set_essid(sock, dev, ssid, WAPI_ESSID_ON);
++    if (ret != OK) {
++        usleep(500000);
++        ret = wapi_set_essid(sock, dev, ssid, WAPI_ESSID_ON);
++    }
++    close(sock);
++    if (ret != OK)
++        return ERROR;
++    if (netlib_obtain_ipv4addr(dev) != OK
++        || network_wait_connected(15000) != OK)
+         return ERROR;
+-    }
+ 
+-    syslog(LOG_INFO, "[%s] Connecting WiFi SSID=%s on %s\n", TAG, ssid, dev);
+-
+-    snprintf(cmd, sizeof(cmd), "ifup %s", dev); /* bring up iface first */
+-    system(cmd);
+-    usleep(500000); /* wait for driver ready */
+-
+-    snprintf(cmd, sizeof(cmd), "wapi mode %s 2", dev); /* MANAGED */
+-    system(cmd);
+-
+-    if (pass && pass[0]) {
+-        snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3", dev, q_pass);
+-        system(cmd);
+-    }
+-
+-    snprintf(cmd, sizeof(cmd), "wapi essid %s %s 1", dev, q_ssid);
+-    system(cmd);
+-    usleep(2000000); /* wait for AP association */
+-
+-    /* P1: verify WiFi association before requesting DHCP.
+-     * 'wapi status' always exits 0 (it just prints iface state), so
+-     * checking its return code is useless. Instead, parse the output
+-     * for "Not-Associated" which wapi prints when no AP is joined.
+-     * If popen fails we fall through and let network_wait_connected
+-     * handle the timeout. */
+-    {
+-        bool associated = true;
+-        snprintf(cmd, sizeof(cmd), "wapi status %s", dev);
+-        FILE* fp = popen(cmd, "r");
+-        if (fp) {
+-            char line[256];
+-            while (fgets(line, sizeof(line), fp)) {
+-                if (strstr(line, "Not-Associated")) {
+-                    associated = false;
+-                    break;
+-                }
+-            }
+-            pclose(fp);
+-        }
+-        if (!associated) {
+-            syslog(LOG_ERR,
+-                "[%s] WiFi not associated (no carrier), skipping DHCP\n", TAG);
+-            return ERROR;
+-        }
++    if (persist) {
++        agent_config_set(AGENT_CFG_KEY_WIFI_SSID, ssid);
++        agent_config_set(AGENT_CFG_KEY_WIFI_PASS, pass ? pass : "");
+     }
++    return OK;
++}
++
++int network_wifi_connect(const char* iface, const char* ssid,
++    const char* pass)
++{
++    int ret;
+ 
+-    snprintf(cmd, sizeof(cmd), "renew %s", dev); /* DHCP */
+-    system(cmd);
++    pthread_mutex_lock(&s_wifi_connect_mutex);
++    ret = network_wifi_connect_impl(iface, ssid, pass, true);
++    pthread_mutex_unlock(&s_wifi_connect_mutex);
++    return ret;
++}
+ 
+-    /* Persist credentials.
+-     * P2: always write the PSK slot — even when pass is empty — so that
+-     * switching from a secured AP to an open one clears the stale PSK.
+-     * network_wifi_reconnect() would otherwise re-send the old wapi psk
+-     * command on the next boot, breaking reconnect for open networks. */
+-    agent_config_set(AGENT_CFG_KEY_WIFI_SSID, ssid);
+-    agent_config_set(AGENT_CFG_KEY_WIFI_PASS, (pass && pass[0]) ? pass : "");
++int network_wifi_connect_boot(const char* iface, const char* ssid,
++    const char* pass)
++{
++    int ret;
+ 
+-    int err = network_wait_connected(15000);
+-    if (err == OK)
+-        syslog(LOG_INFO, "[%s] WiFi connected: %s\n", TAG, network_get_ip());
+-    else
+-        syslog(LOG_WARNING, "[%s] No IP after 15s — check SSID/password\n", TAG);
+-    return err;
++    pthread_mutex_lock(&s_wifi_connect_mutex);
++    ret = network_wifi_connect_impl(iface, ssid, pass, false);
++    pthread_mutex_unlock(&s_wifi_connect_mutex);
++    return ret;
+ }
+ 
+ int network_wifi_reconnect(void)
+diff --git a/src/infra/network_manager.h b/src/infra/network_manager.h
+index df9b819..78f37d4 100644
+--- a/src/infra/network_manager.h
++++ b/src/infra/network_manager.h
+@@ -45,6 +45,10 @@ const char *network_get_ip(void);
+  */
+ int network_wifi_connect(const char *iface, const char *ssid, const char *pass);
+ 
++/** Connect during boot without console output or rewriting saved credentials. */
++int network_wifi_connect_boot(const char *iface, const char *ssid,
++                              const char *pass);
++
+ /** Re-connect using credentials saved in config_store (called at startup). */
+ int network_wifi_reconnect(void);
+ 
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index 0b36760..f04bdf2 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -112,6 +112,45 @@ static size_t decode_chunked(char* buf, size_t len)
+     return (size_t)(dst - buf);
+ }
+ 
++static bool chunked_message_complete(const char* buf, size_t len)
++{
++    size_t pos = 0;
++
++    while (pos < len) {
++        const char* line_end = memmem(buf + pos, len - pos, "\r\n", 2);
++        if (!line_end)
++            return false;
++
++        char* endptr;
++        long chunk_size = strtol(buf + pos, &endptr, 16);
++        if (endptr == buf + pos || chunk_size < 0 || endptr > line_end)
++            return false;
++
++        while (endptr < line_end && (*endptr == ' ' || *endptr == '\t'))
++            endptr++;
++        if (endptr < line_end && *endptr != ';')
++            return false;
++
++        size_t data_pos = (size_t)(line_end - buf) + 2;
++        if (chunk_size == 0) {
++            return memmem(line_end, len - (size_t)(line_end - buf),
++                       "\r\n\r\n", 4)
++                != NULL;
++        }
++
++        if ((size_t)chunk_size > len - data_pos
++            || data_pos + (size_t)chunk_size + 2 > len)
++            return false;
++
++        pos = data_pos + (size_t)chunk_size;
++        if (buf[pos] != '\r' || buf[pos + 1] != '\n')
++            return false;
++        pos += 2;
++    }
++
++    return false;
++}
++
+ /* ── TLS context ─────────────────────────────────────────────── */
+ 
+ typedef struct {
+@@ -545,7 +584,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+         } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+             eof = 1;
+             break;
+-        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
++        } else if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
++            syslog(LOG_ERR, "[%s] TLS response header timed out\n", TAG);
++            tls_raw_release(raw);
++            return VELA_TLS_ERR_READ;
++        } else {
+             syslog(LOG_ERR, "[%s] ssl_read (header) ret=0x%x\n", TAG, -ret);
+             tls_raw_release(raw);
+             return VELA_TLS_ERR_READ;
+@@ -613,6 +656,8 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+         while (resp_pos < resp_cap - 1) {
+             if (content_length >= 0 && (long)resp_pos >= content_length)
+                 break;
++            if (chunked && chunked_message_complete(resp_buf, resp_pos))
++                break;
+             ret = mbedtls_ssl_read(&ctx->ssl,
+                 (unsigned char*)(resp_buf + resp_pos),
+                 resp_cap - 1 - resp_pos);
+@@ -620,7 +665,11 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+                 resp_pos += (size_t)ret;
+             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                 break;
+-            } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
++            } else if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
++                syslog(LOG_ERR, "[%s] TLS response body timed out\n", TAG);
++                tls_raw_release(raw);
++                return VELA_TLS_ERR_READ;
++            } else {
+                 break;
+             }
+         }
+diff --git a/src/llm/llm_router.c b/src/llm/llm_router.c
+index aa586f2..c6cbe4f 100644
+--- a/src/llm/llm_router.c
++++ b/src/llm/llm_router.c
+@@ -106,8 +106,10 @@ int llm_router_init(void)
+         }
+     }
+ 
+-    /* Load backends from config */
+-    s_backend_count = 0;
++    /* Load backends from config. Keep runtime-only backends that were set by
++     * board bring-up or a direct NSH command in the same process.
++     */
++    int runtime_count = s_backend_count;
+     for (int i = 0; i < LLM_ROUTER_MAX_BACKENDS; i++) {
+         char key[64];
+         char json[1024] = { 0 };
+@@ -150,13 +152,19 @@ int llm_router_init(void)
+ 
+         b->enabled = true;
+         b->fail_count = 0;
+-        s_backend_count++;
++        if (i >= s_backend_count) {
++            s_backend_count = i + 1;
++        }
+ 
+         cJSON_Delete(obj);
+         syslog(LOG_INFO, "[%s] Loaded backend %d: %s (model: %s, tier: %d)\n",
+             TAG, i, b->host, b->model, b->cost_tier);
+     }
+ 
++    if (runtime_count > s_backend_count) {
++        s_backend_count = runtime_count;
++    }
++
+     pthread_mutex_unlock(&s_router_lock);
+ 
+     syslog(LOG_INFO, "[%s] Router initialized: %d backends, profile=%d\n",
+@@ -212,6 +220,27 @@ int llm_router_set_backend(int index, const llm_backend_t* backend)
+     return 0;
+ }
+ 
++int llm_router_set_backend_runtime(int index, const llm_backend_t* backend)
++{
++    if (index < 0 || index >= LLM_ROUTER_MAX_BACKENDS || !backend) {
++        return -1;
++    }
++
++    pthread_mutex_lock(&s_router_lock);
++    memcpy(&s_backends[index], backend, sizeof(llm_backend_t));
++    s_backends[index].fail_count = 0;
++
++    if (index >= s_backend_count) {
++        s_backend_count = index + 1;
++    }
++
++    pthread_mutex_unlock(&s_router_lock);
++
++    syslog(LOG_INFO, "[%s] Runtime backend %d configured: %s\n",
++        TAG, index, backend->host);
++    return 0;
++}
++
+ int llm_router_get_backend(int index, llm_backend_t* backend)
+ {
+     if (index < 0 || index >= LLM_ROUTER_MAX_BACKENDS || !backend) {
+@@ -563,7 +592,14 @@ char* llm_router_status_json(void)
+         profile_name = "premium";
+     }
+     cJSON_AddStringToObject(root, "profile", profile_name);
+-    cJSON_AddNumberToObject(root, "backend_count", s_backend_count);
++
++    int active_backend_count = 0;
++    for (int i = 0; i < LLM_ROUTER_MAX_BACKENDS; i++) {
++        if (s_backends[i].host[0] != '\0' && s_backends[i].enabled) {
++            active_backend_count++;
++        }
++    }
++    cJSON_AddNumberToObject(root, "backend_count", active_backend_count);
+ 
+     /* Backends array */
+     cJSON* backends = cJSON_CreateArray();
+diff --git a/src/llm/llm_router.h b/src/llm/llm_router.h
+index e8b8d6d..f7f5d9e 100644
+--- a/src/llm/llm_router.h
++++ b/src/llm/llm_router.h
+@@ -87,6 +87,13 @@ int llm_router_init(void);
+  */
+ int llm_router_set_backend(int index, const llm_backend_t* backend);
+ 
++/**
++ * Add or update a backend for the current boot only.
++ * This does not persist into config_store and is useful on targets without
++ * writable /data during early hardware bring-up.
++ */
++int llm_router_set_backend_runtime(int index, const llm_backend_t* backend);
++
+ /**
+  * Get backend configuration.
+  * @param index Backend index
+diff --git a/src/voice/volc_asr.c b/src/voice/volc_asr.c
+index ee8dc4a..731e218 100644
+--- a/src/voice/volc_asr.c
++++ b/src/voice/volc_asr.c
+@@ -50,6 +50,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
+@@ -57,6 +58,13 @@
+ 
+ static const char* TAG = "volc_asr";
+ 
++static long elapsed_ms(const struct timespec* start,
++    const struct timespec* end)
++{
++    return (end->tv_sec - start->tv_sec) * 1000L
++        + (end->tv_nsec - start->tv_nsec) / 1000000L;
++}
++
+ /* Volcengine binary protocol constants */
+ #define VOLC_PROTO_VER 0x11 /* version=1, header_size=1 (x4=4B) */
+ #define VOLC_MSG_FULL_REQ 0x10 /* full_client_request */
+@@ -84,8 +92,66 @@ typedef struct {
+     mbedtls_ssl_config cfg;
+     mbedtls_net_context net;
+     mbedtls_ctr_drbg_context ctr_drbg;
++    const char* request_app_id;
++    const char* request_token;
++    int use_v3;
++    int32_t tx_sequence;
++    size_t tls_tx_bytes;
++    size_t tls_rx_bytes;
++    unsigned int tls_tx_calls;
++    unsigned int tls_rx_calls;
++    int tls_last_tx_ret;
++    int tls_last_rx_ret;
++    int tls_last_tx_errno;
++    int tls_last_rx_errno;
+ } asr_tls_ctx_t;
+ 
++static int asr_tls_send(void* data, const unsigned char* buf, size_t len)
++{
++    asr_tls_ctx_t* ctx = data;
++    int ret = mbedtls_net_send(&ctx->net, buf, len);
++    int net_errno = ret < 0 ? errno : 0;
++
++    ctx->tls_tx_calls++;
++    ctx->tls_last_tx_ret = ret;
++    ctx->tls_last_tx_errno = net_errno;
++    if (ret > 0) {
++        ctx->tls_tx_bytes += (size_t)ret;
++    }
++    printf("[volc_asr] TLS tx #%u state=%d len=%zu ret=%d errno=%d "
++           "hdr=%02x%02x%02x%02x%02x\n",
++        ctx->tls_tx_calls, ctx->ssl.MBEDTLS_PRIVATE(state), len, ret,
++        net_errno,
++        len > 0 ? buf[0] : 0, len > 1 ? buf[1] : 0,
++        len > 2 ? buf[2] : 0, len > 3 ? buf[3] : 0,
++        len > 4 ? buf[4] : 0);
++    return ret;
++}
++
++static int asr_tls_recv(void* data, unsigned char* buf, size_t len)
++{
++    asr_tls_ctx_t* ctx = data;
++    int ret = mbedtls_net_recv(&ctx->net, buf, len);
++    int net_errno = ret < 0 ? errno : 0;
++
++    ctx->tls_rx_calls++;
++    ctx->tls_last_rx_ret = ret;
++    ctx->tls_last_rx_errno = net_errno;
++    if (ret > 0) {
++        ctx->tls_rx_bytes += (size_t)ret;
++    }
++    printf("[volc_asr] TLS rx #%u state=%d want=%zu ret=%d errno=%d",
++        ctx->tls_rx_calls, ctx->ssl.MBEDTLS_PRIVATE(state), len, ret,
++        net_errno);
++    if (ret > 0) {
++        printf(" hdr=%02x%02x%02x%02x%02x",
++            buf[0], ret > 1 ? buf[1] : 0, ret > 2 ? buf[2] : 0,
++            ret > 3 ? buf[3] : 0, ret > 4 ? buf[4] : 0);
++    }
++    printf("\n");
++    return ret;
++}
++
+ /* ── Entropy source ──────────────────────────────────────────── */
+ 
+ static int asr_entropy_func(void* data, unsigned char* output, size_t len)
+@@ -104,7 +170,21 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+     const char* host, const char* port)
+ {
+     int ret;
+-
++    struct timespec handshake_start;
++    struct timespec handshake_end;
++
++    ctx->request_app_id = NULL;
++    ctx->request_token = NULL;
++    ctx->use_v3 = 0;
++    ctx->tx_sequence = 0;
++    ctx->tls_tx_bytes = 0;
++    ctx->tls_rx_bytes = 0;
++    ctx->tls_tx_calls = 0;
++    ctx->tls_rx_calls = 0;
++    ctx->tls_last_tx_ret = 0;
++    ctx->tls_last_rx_ret = 0;
++    ctx->tls_last_tx_errno = 0;
++    ctx->tls_last_rx_errno = 0;
+     mbedtls_ssl_init(&ctx->ssl);
+     mbedtls_ssl_config_init(&ctx->cfg);
+     mbedtls_net_init(&ctx->net);
+@@ -117,6 +197,7 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+         strlen(pers));
+     if (ret != 0) {
+         syslog(LOG_ERR, "[%s] ctr_drbg_seed: -0x%04x\n", TAG, -ret);
++        printf("[volc_asr] entropy failed: TLS -0x%04x\n", -ret);
+         return -EIO;
+     }
+ 
+@@ -137,8 +218,11 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+         ret = mbedtls_net_connect(&ctx->net, host, port,
+             MBEDTLS_NET_PROTO_TCP);
+         if (ret != 0) {
++            int socket_errno = errno;
+             syslog(LOG_ERR, "[%s] net_connect %s:%s: -0x%04x\n",
+                 TAG, host, port, -ret);
++            printf("[volc_asr] TCP connect failed: -0x%04x errno=%d fd=%d\n",
++                -ret, socket_errno, ctx->net.fd);
+             return -ECONNREFUSED;
+         }
+     }
+@@ -149,6 +233,8 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+ 
+         setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO,
+             &tv, sizeof(tv));
++        setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO,
++            &tv, sizeof(tv));
+     }
+ 
+     ret = mbedtls_ssl_config_defaults(&ctx->cfg,
+@@ -156,6 +242,7 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+         MBEDTLS_SSL_TRANSPORT_STREAM,
+         MBEDTLS_SSL_PRESET_DEFAULT);
+     if (ret != 0) {
++        printf("[volc_asr] TLS config failed: -0x%04x\n", -ret);
+         return -EIO;
+     }
+ 
+@@ -181,29 +268,69 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
+ 
+     ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->cfg);
+     if (ret != 0) {
++        printf("[volc_asr] TLS setup failed: -0x%04x\n", -ret);
++        return -EIO;
++    }
++
++    ret = mbedtls_ssl_set_hostname(&ctx->ssl, host);
++    if (ret != 0) {
++        char err_buf[128];
++
++        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
++        printf("[volc_asr] TLS SNI setup failed for %s: -0x%04x (%s)\n",
++            host, -ret, err_buf);
+         return -EIO;
+     }
+ 
+-    mbedtls_ssl_set_hostname(&ctx->ssl, host);
+-    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
+-        mbedtls_net_send, mbedtls_net_recv, NULL);
++    mbedtls_ssl_set_bio(&ctx->ssl, ctx,
++        asr_tls_send, asr_tls_recv, NULL);
+ 
++    clock_gettime(CLOCK_MONOTONIC, &handshake_start);
++    printf("[volc_asr] TCP connected; starting TLS handshake host=%s SNI=%s\n",
++        host, host);
+     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+         if (ret != MBEDTLS_ERR_SSL_WANT_READ
+             && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++            int socket_errno = errno;
++            char err_buf[128];
++
++            clock_gettime(CLOCK_MONOTONIC, &handshake_end);
++            mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+             syslog(LOG_ERR, "[%s] handshake: -0x%04x\n", TAG, -ret);
++            printf("[volc_asr] TLS handshake failed after %ld ms: "
++                   "-0x%04x (%s) errno=%d fd=%d "
++                   "state=%d tx=%zu/%u last_tx=%d/%d "
++                   "rx=%zu/%u last_rx=%d/%d\n",
++                elapsed_ms(&handshake_start, &handshake_end),
++                -ret, err_buf, socket_errno, ctx->net.fd,
++                ctx->ssl.MBEDTLS_PRIVATE(state),
++                ctx->tls_tx_bytes, ctx->tls_tx_calls, ctx->tls_last_tx_ret,
++                ctx->tls_last_tx_errno, ctx->tls_rx_bytes,
++                ctx->tls_rx_calls, ctx->tls_last_rx_ret,
++                ctx->tls_last_rx_errno);
+             return -EIO;
+         }
+     }
+ 
++    clock_gettime(CLOCK_MONOTONIC, &handshake_end);
+     syslog(LOG_INFO, "[%s] TLS connected to %s:%s\n", TAG, host, port);
++    printf("[volc_asr] TLS connected after %ld ms, version=%s, "
++           "verify=0x%08lx tx=%zu/%u rx=%zu/%u\n",
++        elapsed_ms(&handshake_start, &handshake_end),
++        mbedtls_ssl_get_version(&ctx->ssl),
++        (unsigned long)mbedtls_ssl_get_verify_result(&ctx->ssl),
++        ctx->tls_tx_bytes, ctx->tls_tx_calls,
++        ctx->tls_rx_bytes, ctx->tls_rx_calls);
+     return 0;
+ }
+ 
+ static void asr_tls_free(asr_tls_ctx_t* ctx)
+ {
+     mbedtls_ssl_close_notify(&ctx->ssl);
+-    mbedtls_net_free(&ctx->net);
++    /* NuttX close already arranges TCP teardown.  A preceding asynchronous
++     * shutdown can race with that teardown and retain closed connections.
++     */
++    mbedtls_net_close(&ctx->net);
+     mbedtls_ssl_free(&ctx->ssl);
+     mbedtls_ssl_config_free(&ctx->cfg);
+     mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
+@@ -223,7 +350,10 @@ static int tls_write_all(asr_tls_ctx_t* ctx,
+         if (ret > 0) {
+             written += (size_t)ret;
+         } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++            int socket_errno = errno;
+             syslog(LOG_ERR, "[%s] ssl_write: -0x%04x\n", TAG, -ret);
++            printf("[volc_asr] TLS write failed: -0x%04x errno=%d fd=%d\n",
++                -ret, socket_errno, ctx->net.fd);
+             return -EIO;
+         }
+     }
+@@ -244,7 +374,10 @@ static int tls_read_all(asr_tls_ctx_t* ctx,
+             || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+             return -ECONNRESET;
+         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
++            int socket_errno = errno;
+             syslog(LOG_ERR, "[%s] ssl_read: -0x%04x\n", TAG, -ret);
++            printf("[volc_asr] TLS read failed: -0x%04x errno=%d fd=%d\n",
++                -ret, socket_errno, ctx->net.fd);
+             return -EIO;
+         }
+     }
+@@ -272,8 +405,34 @@ static void generate_uuid(char* out, size_t cap)
+ /* ── WebSocket upgrade handshake ─────────────────────────────── */
+ 
+ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+-    const char* path, const char* token)
++    const char* path, const char* token, const char* app_id,
++    const char* resource, int streaming)
+ {
++    ctx->use_v3 = strncmp(resource, "volc.seedasr.sauc.", 18) == 0
++        || strncmp(resource, "volc.bigasr.sauc.", 17) == 0;
++    char auth[768];
++    char connect_id[ASR_UUID_LEN];
++    int auth_len;
++
++    if (ctx->use_v3) {
++        generate_uuid(connect_id, sizeof(connect_id));
++        path = streaming ? "/api/v3/sauc/bigmodel_async"
++                         : "/api/v3/sauc/bigmodel_nostream";
++        auth_len = snprintf(auth, sizeof(auth),
++            "X-Api-App-Key: %s\r\n"
++            "X-Api-Access-Key: %s\r\n"
++            "X-Api-Resource-Id: %s\r\n"
++            "X-Api-Request-Id: %s\r\n"
++            "X-Api-Connect-Id: %s\r\n",
++            app_id, token, resource, connect_id, connect_id);
++    } else {
++        auth_len = snprintf(auth, sizeof(auth),
++            "Authorization: Bearer;%s\r\n", token);
++    }
++    if (auth_len < 0 || auth_len >= (int)sizeof(auth)) {
++        return -EOVERFLOW;
++    }
++
+     /* Generate random 16-byte key, base64-encode it */
+     unsigned char key_raw[16];
+     unsigned char key_b64[32];
+@@ -283,7 +442,7 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+     mbedtls_base64_encode(key_b64, sizeof(key_b64), &key_b64_len,
+         key_raw, sizeof(key_raw));
+ 
+-    char req[768];
++    char req[1200];
+     int n = snprintf(req, sizeof(req),
+         "GET %s HTTP/1.1\r\n"
+         "Host: %s\r\n"
+@@ -291,10 +450,10 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+         "Connection: Upgrade\r\n"
+         "Sec-WebSocket-Key: %.*s\r\n"
+         "Sec-WebSocket-Version: 13\r\n"
+-        "Authorization: Bearer;%s\r\n"
++        "%s"
+         "\r\n",
+         path, host, (int)key_b64_len, key_b64,
+-        token);
++        auth);
+ 
+     if (n <= 0 || n >= (int)sizeof(req)) {
+         return -EOVERFLOW;
+@@ -325,6 +484,7 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+             || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+             return -ECONNRESET;
+         } else if (r != MBEDTLS_ERR_SSL_WANT_READ) {
++            printf("[volc_asr] WebSocket response failed: TLS -0x%04x\n", -r);
+             return -EIO;
+         }
+     }
+@@ -334,10 +494,12 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
+     if (sscanf(resp, "HTTP/1.1 %d", &status) != 1 || status != 101) {
+         syslog(LOG_ERR, "[%s] WS upgrade failed: HTTP %d\n",
+             TAG, status);
++        printf("[volc_asr] WebSocket upgrade failed: HTTP %d\n", status);
+         return -EPROTO;
+     }
+ 
+     syslog(LOG_INFO, "[%s] WebSocket upgrade OK\n", TAG);
++    printf("[volc_asr] WebSocket connected\n");
+     return 0;
+ }
+ 
+@@ -483,7 +645,8 @@ static int send_volc_frame(asr_tls_ctx_t* ctx,
+     const unsigned char* payload,
+     size_t plen)
+ {
+-    unsigned char* frame = malloc(VOLC_HDR_SIZE + plen);
++    size_t header_size = VOLC_HDR_SIZE + (ctx->use_v3 ? 4 : 0);
++    unsigned char* frame = malloc(header_size + plen);
+ 
+     if (!frame) {
+         return -ENOMEM;
+@@ -493,16 +656,29 @@ static int send_volc_frame(asr_tls_ctx_t* ctx,
+     frame[1] = msg_type;
+     frame[2] = serialization;
+     frame[3] = 0x00;
+-    frame[4] = (unsigned char)((plen >> 24) & 0xFF);
+-    frame[5] = (unsigned char)((plen >> 16) & 0xFF);
+-    frame[6] = (unsigned char)((plen >> 8) & 0xFF);
+-    frame[7] = (unsigned char)(plen & 0xFF);
++    size_t size_off = 4;
++    if (ctx->use_v3) {
++        uint32_t sequence = (uint32_t)++ctx->tx_sequence;
++        frame[1] |= 1;
++        if (msg_type == VOLC_MSG_AUDIO_LAST) {
++            sequence = (uint32_t)-ctx->tx_sequence;
++        }
++        frame[4] = (unsigned char)(sequence >> 24);
++        frame[5] = (unsigned char)(sequence >> 16);
++        frame[6] = (unsigned char)(sequence >> 8);
++        frame[7] = (unsigned char)sequence;
++        size_off += 4;
++    }
++    frame[size_off] = (unsigned char)((plen >> 24) & 0xFF);
++    frame[size_off + 1] = (unsigned char)((plen >> 16) & 0xFF);
++    frame[size_off + 2] = (unsigned char)((plen >> 8) & 0xFF);
++    frame[size_off + 3] = (unsigned char)(plen & 0xFF);
+ 
+     if (plen > 0) {
+-        memcpy(frame + VOLC_HDR_SIZE, payload, plen);
++        memcpy(frame + header_size, payload, plen);
+     }
+ 
+-    int ret = ws_send_binary(ctx, frame, VOLC_HDR_SIZE + plen);
++    int ret = ws_send_binary(ctx, frame, header_size + plen);
+ 
+     free(frame);
+     return ret;
+@@ -516,6 +692,8 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+ {
+     char reqid[ASR_UUID_LEN];
+ 
++    ctx->request_app_id = app_id;
++    ctx->request_token = token;
+     generate_uuid(reqid, sizeof(reqid));
+ 
+     cJSON* root = cJSON_CreateObject();
+@@ -525,11 +703,13 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+     }
+ 
+     /* app */
+-    cJSON* app = cJSON_AddObjectToObject(root, "app");
++    cJSON* app = ctx->use_v3 ? NULL : cJSON_AddObjectToObject(root, "app");
+ 
+-    cJSON_AddStringToObject(app, "appid", app_id);
+-    cJSON_AddStringToObject(app, "token", token);
+-    cJSON_AddStringToObject(app, "cluster", cluster);
++    if (!ctx->use_v3) {
++        cJSON_AddStringToObject(app, "appid", app_id);
++        cJSON_AddStringToObject(app, "token", token);
++        cJSON_AddStringToObject(app, "cluster", cluster);
++    }
+ 
+     /* user */
+     cJSON* user = cJSON_AddObjectToObject(root, "user");
+@@ -539,7 +719,7 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+     /* audio */
+     cJSON* audio = cJSON_AddObjectToObject(root, "audio");
+ 
+-    cJSON_AddStringToObject(audio, "format", "raw");
++    cJSON_AddStringToObject(audio, "format", ctx->use_v3 ? "pcm" : "raw");
+     cJSON_AddNumberToObject(audio, "rate",
+         AGENT_VOICE_SAMPLE_RATE);
+     cJSON_AddNumberToObject(audio, "bits", AGENT_VOICE_BITS);
+@@ -550,16 +730,23 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
+     /* request */
+     cJSON* req = cJSON_AddObjectToObject(root, "request");
+ 
+-    cJSON_AddStringToObject(req, "reqid", reqid);
+-    cJSON_AddStringToObject(req, "workflow",
+-        "audio_in,resample,partition,vad,fe,decode");
+-    cJSON_AddNumberToObject(req, "sequence", 1);
+-    cJSON_AddNumberToObject(req, "nbest", 1);
+-    cJSON_AddBoolToObject(req, "show_utterances", 0);
+-    /* VAD: avoid cutting short commands on QEMU virtual mic */
+-    cJSON_AddBoolToObject(req, "vad_signal", 1);
+-    cJSON_AddStringToObject(req, "start_silence_time", "3000");
+-    cJSON_AddStringToObject(req, "vad_silence_time", "800");
++    if (ctx->use_v3) {
++        cJSON_AddStringToObject(req, "model_name", "bigmodel");
++        cJSON_AddBoolToObject(req, "enable_itn", 1);
++        cJSON_AddBoolToObject(req, "enable_punc", 1);
++        cJSON_AddStringToObject(req, "result_type", "full");
++    } else {
++        cJSON_AddStringToObject(req, "reqid", reqid);
++        cJSON_AddStringToObject(req, "workflow",
++            "audio_in,resample,partition,vad,fe,decode");
++        cJSON_AddNumberToObject(req, "sequence", 1);
++        cJSON_AddNumberToObject(req, "nbest", 1);
++        cJSON_AddBoolToObject(req, "show_utterances", 0);
++        /* VAD: avoid cutting short commands on QEMU virtual mic */
++        cJSON_AddBoolToObject(req, "vad_signal", 1);
++        cJSON_AddStringToObject(req, "start_silence_time", "3000");
++        cJSON_AddStringToObject(req, "vad_silence_time", "800");
++    }
+ 
+     char* json_str = cJSON_PrintUnformatted(root);
+ 
+@@ -616,7 +803,7 @@ static uint32_t read_be32(const unsigned char* buf, size_t off)
+ static int recv_volc_response(asr_tls_ctx_t* ctx,
+     char* text_out, size_t text_cap)
+ {
+-    unsigned char* buf = malloc(WS_BUF_SIZE);
++    unsigned char* buf = malloc(WS_BUF_SIZE + 1);
+ 
+     if (!buf) {
+         return -ENOMEM;
+@@ -649,6 +836,7 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+     size_t volc_hdr_len = (size_t)hdr_units * 4;
+     unsigned char msg_type_byte = buf[1];
+     unsigned char msg_type_nibble = (msg_type_byte >> 4) & 0x0F;
++    int final_package = (msg_type_byte & 2) != 0;
+ 
+     if (volc_hdr_len < 4 || flen < volc_hdr_len) {
+         syslog(LOG_ERR,
+@@ -658,6 +846,19 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+         return -EPROTO;
+     }
+ 
++    /* V3 responses may carry a sequence and an event before payload size. */
++    size_t optional_size = ((msg_type_byte & 1) ? 4 : 0)
++        + ((msg_type_byte & 4) ? 4 : 0);
++    if (flen - volc_hdr_len < optional_size) {
++        free(buf);
++        return -EPROTO;
++    }
++    volc_hdr_len += optional_size;
++    if ((buf[2] & 0x0f) != 0) {
++        free(buf);
++        return -ENOTSUP;
++    }
++
+     /* ── Error response: special layout with error_code field ── */
+     if (msg_type_nibble == 0x0F) {
+         /* [4B hdr][4B error_code][4B msg_size][msg...] */
+@@ -677,7 +878,22 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+             msg_size = (uint32_t)(flen - msg_off);
+         }
+ 
+-        /* NUL-terminate and log the error message */
++        /* Redact credentials before truncating the server's diagnostic. */
++        const char* secrets[] = { ctx->request_app_id, ctx->request_token };
++
++        for (size_t k = 0; k < sizeof(secrets) / sizeof(secrets[0]); k++) {
++            size_t secret_len = secrets[k] ? strlen(secrets[k]) : 0;
++
++            if (secret_len == 0 || secret_len > msg_size) {
++                continue;
++            }
++            for (size_t i = 0; i <= msg_size - secret_len; i++) {
++                if (memcmp(buf + msg_off + i, secrets[k], secret_len) == 0) {
++                    memset(buf + msg_off + i, '*', secret_len);
++                }
++            }
++        }
++
+         char errbuf[256];
+         size_t cplen = msg_size;
+ 
+@@ -686,10 +902,17 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+         }
+         memcpy(errbuf, buf + msg_off, cplen);
+         errbuf[cplen] = '\0';
++        for (size_t i = 0; i < cplen; i++) {
++            if ((unsigned char)errbuf[i] < 0x20 || errbuf[i] == 0x7f) {
++                errbuf[i] = ' ';
++            }
++        }
+ 
+         syslog(LOG_ERR,
+             "[%s] Server error %lu: %s\n",
+             TAG, (unsigned long)err_code, errbuf);
++        printf("[volc_asr] Server error %lu: %s\n",
++            (unsigned long)err_code, errbuf);
+         free(buf);
+         return -EIO;
+     }
+@@ -736,7 +959,9 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+     cJSON* code_j = cJSON_GetObjectItem(root, "code");
+     int code = code_j ? (int)code_j->valuedouble : -1;
+ 
+-    if (code != ASR_RESP_CODE_OK) {
++    if ((!ctx->use_v3 && code != ASR_RESP_CODE_OK)
++        || (ctx->use_v3 && code_j && code != 0 && code != 20000000)) {
++        printf("[volc_asr] ASR response code: %d\n", code);
+         cJSON* msg_j = cJSON_GetObjectItem(root, "message");
+ 
+         syslog(LOG_ERR, "[%s] ASR error %d: %s\n", TAG, code,
+@@ -756,6 +981,15 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
+      * advance confirmed_len. */
+     cJSON* result = cJSON_GetObjectItem(root, "result");
+ 
++    if (ctx->use_v3) {
++        cJSON* txt = cJSON_GetObjectItem(result, "text");
++        if (cJSON_IsString(txt) && txt->valuestring) {
++            snprintf(text_out, text_cap, "%s", txt->valuestring);
++        }
++        cJSON_Delete(root);
++        return final_package ? 1 : 0;
++    }
++
+     /* Negative sequence means final response */
+     cJSON* seq_j = cJSON_GetObjectItem(root, "sequence");
+     int seq = seq_j ? (int)seq_j->valuedouble : 0;
+@@ -849,8 +1083,17 @@ int volc_asr_recognize(const unsigned char* pcm_data,
+     int ret;
+ 
+     /* 1. TLS connect */
+-    ret = asr_tls_connect(&ctx, AGENT_DOUBAO_ASR_HOST,
+-        AGENT_DOUBAO_ASR_PORT);
++    for (int attempt = 0; attempt < 2; attempt++) {
++        ret = asr_tls_connect(&ctx, AGENT_DOUBAO_ASR_HOST,
++            AGENT_DOUBAO_ASR_PORT);
++        if (ret == 0 || attempt == 1
++            || (ret != -EIO && ret != -ECONNREFUSED)) {
++            break;
++        }
++        asr_tls_free(&ctx);
++        printf("[volc_asr] Connection failed; retrying once before audio upload\n");
++        usleep(500000);
++    }
+     if (ret != 0) {
+         asr_tls_free(&ctx);
+         return ret;
+@@ -858,7 +1101,7 @@ int volc_asr_recognize(const unsigned char* pcm_data,
+ 
+     /* 2. WebSocket upgrade */
+     ret = ws_upgrade(&ctx, AGENT_DOUBAO_ASR_HOST,
+-        AGENT_DOUBAO_ASR_WS_PATH, token);
++        AGENT_DOUBAO_ASR_WS_PATH, token, app_id, cluster, 0);
+     if (ret != 0) {
+         asr_tls_free(&ctx);
+         return ret;
+@@ -893,6 +1136,7 @@ int volc_asr_recognize(const unsigned char* pcm_data,
+ 
+     syslog(LOG_INFO, "[%s] Sent %zu bytes in %zu-byte chunks\n",
+         TAG, pcm_len, chunk_size);
++    printf("[volc_asr] Uploaded %zu PCM bytes; waiting for recognition\n", pcm_len);
+ 
+     /* 5. Receive responses until final (sequence < 0) */
+     struct timespec asr_t0;
+@@ -970,7 +1214,7 @@ volc_asr_stream_t* volc_asr_stream_open(void)
+     }
+ 
+     ret = ws_upgrade(&s->tls, AGENT_DOUBAO_ASR_HOST,
+-        AGENT_DOUBAO_ASR_WS_PATH, s_token);
++        AGENT_DOUBAO_ASR_WS_PATH, s_token, s_app_id, s_cluster, 1);
+     if (ret != 0) {
+         asr_tls_free(&s->tls);
+         free(s);
+-- 
+2.25.1
+

@@ -1,0 +1,5 @@
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x009000, 0x006000
+phy_init,   data, phy,     0x00f000, 0x001000
+factory,    app,  factory, 0x010000, 4M
+voice_data, data, fat,     0x410000, 3890K

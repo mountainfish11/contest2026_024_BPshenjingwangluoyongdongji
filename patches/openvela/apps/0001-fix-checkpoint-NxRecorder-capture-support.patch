@@ -1,0 +1,300 @@
+From 3fed86b662d6b2fb71a2a3ab724a15cd27053233 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Tue, 20 Oct 2026 10:21:09 +0800
+Subject: [PATCH] fix: checkpoint NxRecorder capture support
+
+---
+ include/system/nxrecorder.h    |   3 +
+ system/nxrecorder/nxrecorder.c | 127 ++++++++++++++++++++++++++++-----
+ 2 files changed, 112 insertions(+), 18 deletions(-)
+
+diff --git a/include/system/nxrecorder.h b/include/system/nxrecorder.h
+index 4b2c2ac96..acec50689 100644
+--- a/include/system/nxrecorder.h
++++ b/include/system/nxrecorder.h
+@@ -29,6 +29,7 @@
+ 
+ #include <mqueue.h>
+ #include <pthread.h>
++#include <stdint.h>
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -58,6 +59,8 @@ struct nxrecorder_s
+   int             crefs;                   /* Number of references to the recorder */
+   pthread_mutex_t mutex;                   /* Thread sync mutex */
+   int             fd;                      /* File descriptor of open file */
++  uint32_t        record_limit_bytes;      /* Optional byte limit for record */
++  uint32_t        record_bytes;            /* Bytes written in current record */
+   char            device[CONFIG_NAME_MAX]; /* Preferred audio device */
+ #ifdef CONFIG_AUDIO_MULTI_SESSION
+   FAR void        *session;                /* Session assignment from device */
+diff --git a/system/nxrecorder/nxrecorder.c b/system/nxrecorder/nxrecorder.c
+index 10f4806e9..91127951c 100644
+--- a/system/nxrecorder/nxrecorder.c
++++ b/system/nxrecorder/nxrecorder.c
+@@ -29,6 +29,7 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <inttypes.h>
+ #include <sched.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -44,6 +45,7 @@
+ 
+ #include "system/nxrecorder.h"
+ 
++
+ /****************************************************************************
+  * Pre-processor Definitions
+  ****************************************************************************/
+@@ -53,13 +55,17 @@
+ #define NXRECORDER_STATE_PAUSED    2
+ 
+ #ifndef CONFIG_NXRECORDER_MSG_PRIO
+-#  define CONFIG_NXRECORDER_MSG_PRIO  1
++#  define CONFIG_NXRECORDER_MSG_PRIO  2
+ #endif
+ 
+ #ifndef CONFIG_NXRECORDER_RECORDTHREAD_STACKSIZE
+ #  define CONFIG_NXRECORDER_RECORDTHREAD_STACKSIZE    1500
+ #endif
+ 
++#ifndef CONFIG_NXRECORDER_RECORDTHREAD_PRIORITY
++#  define CONFIG_NXRECORDER_RECORDTHREAD_PRIORITY     100
++#endif
++
+ /****************************************************************************
+  * Private Type Declarations
+  ****************************************************************************/
+@@ -385,6 +391,8 @@ static inline int nxrecorder_fmtfromext(FAR struct nxrecorder_s *precorder,
+ static int nxrecorder_writebuffer(FAR struct nxrecorder_s *precorder,
+                                   FAR struct ap_buffer_s *apb)
+ {
++  uint32_t remaining;
++  uint32_t original_nbytes;
+   int ret;
+ 
+   /* Validate the file is still open.  It will be closed automatically when
+@@ -401,6 +409,22 @@ static int nxrecorder_writebuffer(FAR struct nxrecorder_s *precorder,
+       return -ENODATA;
+     }
+ 
++  if (precorder->record_limit_bytes > 0)
++    {
++      if (precorder->record_bytes >= precorder->record_limit_bytes)
++        {
++          return -ENODATA;
++        }
++
++      remaining = precorder->record_limit_bytes - precorder->record_bytes;
++      if (apb->nbytes > remaining)
++        {
++          apb->nbytes = remaining;
++        }
++    }
++
++  original_nbytes = apb->nbytes;
++
+   /* Write data to the file. */
+ 
+   ret = precorder->ops->write_data(precorder->fd, apb);
+@@ -409,9 +433,17 @@ static int nxrecorder_writebuffer(FAR struct nxrecorder_s *precorder,
+       return ret;
+     }
+ 
++  precorder->record_bytes += original_nbytes;
++
+   apb->curbyte = 0;
+   apb->flags   = 0;
+ 
++  if (precorder->record_limit_bytes > 0 &&
++      precorder->record_bytes >= precorder->record_limit_bytes)
++    {
++      return -ENODATA;
++    }
++
+   /* Return OK to indicate that the buffer should be passed through to the
+    * audio device.  This does not necessarily indicate that data was written
+    * correctly.
+@@ -728,12 +760,15 @@ static FAR void *nxrecorder_recordthread(pthread_addr_t pvarg)
+                 ret = nxrecorder_writebuffer(precorder, msg.u.ptr);
+                 if (ret != OK)
+                   {
+-                    /* Out of data.  Stay in the loop until the device sends
+-                     * us a COMPLETE message, but stop trying to record more
+-                     * data.
++                    /* Out of data, or a bounded capture has reached its byte
++                     * limit.  For bounded capture, stop returning buffers and
++                     * let the controlling thread issue AUDIOIOC_STOP; calling
++                     * the lower-half stop from this record thread can deadlock
++                     * with capture callbacks in flight.
+                      */
+ 
+                     streaming = false;
++                    running = false;
+                   }
+ 
+                 /* Enqueue buffer by sending it to the audio driver */
+@@ -782,19 +817,20 @@ static FAR void *nxrecorder_recordthread(pthread_addr_t pvarg)
+ #ifdef CONFIG_DEBUG_FEATURES
+             audinfo("Stopping! outstanding=%d\n", outstanding);
+ #endif
+-
+ #ifdef CONFIG_AUDIO_MULTI_SESSION
+-            ioctl(precorder->dev_fd, AUDIOIOC_STOP,
+-                  (uintptr_t)precorder->session);
++            (void)precorder->session;
+ #else
+-            ioctl(precorder->dev_fd, AUDIOIOC_STOP, 0);
++            ;
+ #endif
+-            /* Stay in the running loop (without sending more data).
+-             * we will need to recover our audio buffers.  We will
+-             * loop until AUDIO_MSG_COMPLETE is received.
++            /* A capture lower half may cancel and return its outstanding
++             * buffers asynchronously after STOP.  Do not make an explicit
++             * user stop depend on a separate COMPLETE message: the lower
++             * half retains its own APB references until those callbacks
++             * finish, so recorder-side cleanup is safe here.
+              */
+ 
+             streaming = false;
++            running = false;
+             break;
+ 
+           /* Message indicating the recordback is complete */
+@@ -818,12 +854,21 @@ static FAR void *nxrecorder_recordthread(pthread_addr_t pvarg)
+ err_out:
+   audinfo("Clean-up and exit\n");
+ 
++#ifdef CONFIG_AUDIO_MULTI_SESSION
++  ioctl(precorder->dev_fd, AUDIOIOC_STOP, (uintptr_t)precorder->session);
++#else
++  ioctl(precorder->dev_fd, AUDIOIOC_STOP, 0);
++#endif
++  usleep(100000);
++
+   if (pbuffers != NULL)
+     {
+       audinfo("Freeing buffers\n");
+       for (x = 0; x < buf_info.nbuffers; x++)
+         {
+-          /* Fill in the buffer descriptor struct to issue a free request */
++          /* Drop the recorder's reference.  Pending I2S callbacks retain
++           * their own references until asynchronous STOP completes.
++           */
+ 
+           if (pbuffers[x] != NULL)
+             {
+@@ -843,7 +888,6 @@ err_out:
+     }
+ 
+   /* Unregister the message queue and release the session */
+-
+   ioctl(precorder->dev_fd,
+         AUDIOIOC_UNREGISTERMQ,
+         (uintptr_t)precorder->mq);
+@@ -858,7 +902,6 @@ err_out:
+ #endif
+ 
+   /* Cleanup */
+-
+   pthread_mutex_lock(&precorder->mutex);
+ 
+   /* Close the files */
+@@ -868,7 +911,6 @@ err_out:
+       close(precorder->fd);                 /* Close the file */
+       precorder->fd = -1;                   /* Clear out the FD */
+     }
+-
+   close(precorder->dev_fd);                 /* Close the device */
+   precorder->dev_fd = -1;                   /* Mark device as closed */
+   mq_close(precorder->mq);                  /* Close the message queue */
+@@ -1003,6 +1045,11 @@ int nxrecorder_setdevice(FAR struct nxrecorder_s *precorder,
+ int nxrecorder_stop(FAR struct nxrecorder_s *precorder)
+ {
+   struct audio_msg_s term_msg;
++  struct mq_attr oldattr;
++  struct mq_attr newattr;
++  bool restore_mqattr = false;
++  int retry;
++  int ret;
+ 
+   DEBUGASSERT(precorder != NULL);
+ 
+@@ -1021,8 +1068,40 @@ int nxrecorder_stop(FAR struct nxrecorder_s *precorder)
+ 
+   term_msg.msg_id = AUDIO_MSG_STOP;
+   term_msg.u.data = 0;
+-  mq_send(precorder->mq, (FAR const char *)&term_msg, sizeof(term_msg),
+-          CONFIG_NXRECORDER_MSG_PRIO);
++
++  if (mq_getattr(precorder->mq, &oldattr) == OK)
++    {
++      newattr = oldattr;
++      newattr.mq_flags |= O_NONBLOCK;
++      restore_mqattr = mq_setattr(precorder->mq, &newattr, NULL) == OK;
++    }
++
++  for (retry = 0; retry < 100; retry++)
++    {
++      ret = mq_send(precorder->mq, (FAR const char *)&term_msg,
++                    sizeof(term_msg), CONFIG_NXRECORDER_MSG_PRIO);
++      if (ret == OK)
++        {
++          break;
++        }
++
++      if (errno != EAGAIN)
++        {
++          break;
++        }
++
++      usleep(10000);
++    }
++
++  if (restore_mqattr)
++    {
++      mq_setattr(precorder->mq, &oldattr, NULL);
++    }
++
++  if (ret < 0)
++    {
++      return -errno;
++    }
+ 
+   /* Join the thread.  The thread will do all the cleanup. */
+ 
+@@ -1245,7 +1324,17 @@ int nxrecorder_recordinternal(FAR struct nxrecorder_s *precorder,
+    */
+ 
+   pthread_attr_init(&tattr);
+-  sparam.sched_priority = sched_get_priority_max(SCHED_FIFO) - 9;
++  /* A near-maximum FIFO priority can starve the controlling application
++   * when an I2S capture device continuously returns buffers.  Keep capture
++   * below the normal NSH/application priority unless a board overrides it.
++   * Make the scheduling attributes explicit; otherwise pthread_create may
++   * inherit the caller's priority and the capture thread can starve the
++   * command thread before it reaches nxrecorder_stop().
++   */
++
++  pthread_attr_setschedpolicy(&tattr, SCHED_FIFO);
++  pthread_attr_setinheritsched(&tattr, PTHREAD_EXPLICIT_SCHED);
++  sparam.sched_priority = CONFIG_NXRECORDER_RECORDTHREAD_PRIORITY;
+   pthread_attr_setschedparam(&tattr, &sparam);
+   pthread_attr_setstacksize(&tattr,
+                             CONFIG_NXRECORDER_RECORDTHREAD_STACKSIZE);
+@@ -1321,6 +1410,8 @@ FAR struct nxrecorder_s *nxrecorder_create(void)
+   precorder->record_id = 0;
+   precorder->crefs = 1;
+   precorder->ops = NULL;
++  precorder->record_limit_bytes = 0;
++  precorder->record_bytes = 0;
+ 
+ #ifdef CONFIG_AUDIO_MULTI_SESSION
+   precorder->session = NULL;
+-- 
+2.25.1
+

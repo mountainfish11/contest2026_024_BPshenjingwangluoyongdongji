@@ -1,0 +1,22 @@
+menu "Sub Board Configuration"
+
+    config SUB_BOARD_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            WiFi SSID for the sub board to connect or host.
+
+    config SUB_BOARD_WIFI_PASSWORD
+        string "WiFi Password"
+        default ""
+        help
+            WiFi password for the sub board.
+
+    config SUB_BOARD_MAIN_IP_FALLBACK
+        string "Main-board IPv4 fallback"
+        default "172.17.159.64"
+        help
+            Main-board IPv4 address used when the WiFi access point blocks
+            UDP broadcast discovery. Leave empty to require discovery.
+
+endmenu

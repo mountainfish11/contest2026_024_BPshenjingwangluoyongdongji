@@ -8,8 +8,15 @@ if(CONFIG_LVX_USE_DEMO_CONTEST2026_024_BLIND_BADGE_APP)
       blind_badge_ai.c
       blind_badge_display.c
       blind_badge_event.c
+      blind_badge_fall.c
+      blind_badge_menu.c
       blind_badge_policy.c
+      blind_badge_service.c
       blind_badge_skill.c
+      blind_badge_state.c
+      blind_badge_vision.c
+      blind_badge_vision_server.c
+      qma7981.c
       uart_link.c
     INCLUDE_DIRECTORIES
       ${NUTTX_APPS_DIR}/packages/ai_agent/include

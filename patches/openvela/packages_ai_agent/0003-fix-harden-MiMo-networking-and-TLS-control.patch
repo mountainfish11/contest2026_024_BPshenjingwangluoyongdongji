@@ -1,0 +1,368 @@
+From 6b9bec83434828b353cd9fb8b876d1cf2a5ac7e1 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Tue, 3 Nov 2026 11:56:15 +0800
+Subject: [PATCH 3/6] fix: harden MiMo networking and TLS control
+
+---
+ include/agent_config.h      |  4 +--
+ src/channels/cmd_llm.c      |  4 +--
+ src/infra/network_manager.c | 38 +++++++++++++++++++++
+ src/infra/network_manager.h |  3 ++
+ src/infra/vela_tls.c        | 66 +++++++++++++++++++++++++++++--------
+ src/infra/vela_tls.h        |  5 +++
+ src/llm/llm_proxy.c         | 34 +++++++++++++++----
+ 7 files changed, 130 insertions(+), 24 deletions(-)
+
+diff --git a/include/agent_config.h b/include/agent_config.h
+index cea15b7..02e71f6 100644
+--- a/include/agent_config.h
++++ b/include/agent_config.h
+@@ -122,7 +122,7 @@
+  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
+  * watchdog to fire first on normal slow responses.  Set higher
+  * to cover TLS handshake + full response read. */
+-#define AGENT_LLM_SOCKET_TIMEOUT_SEC 120
++#define AGENT_LLM_SOCKET_TIMEOUT_SEC 30
+ 
+ /* ── Timezone (POSIX TZ format) ────────────────────────────── */
+ #define AGENT_TIMEZONE "CST-8"
+@@ -156,7 +156,7 @@
+ /* ── MiMo (Xiaomi MiMo platform) ───────────────────────────── */
+ #define AGENT_LLM_MIMO_HOST "token-plan-cn.xiaomimimo.com"
+ #define AGENT_LLM_MIMO_PATH "/v1/chat/completions"
+-#define AGENT_LLM_MIMO_MODEL "mimo-v2.5"
++#define AGENT_LLM_MIMO_MODEL "mimo-v2.6-flash"
+ 
+ /* ── Message Bus ────────────────────────────────────────────── */
+ #define AGENT_BUS_QUEUE_LEN 16
+diff --git a/src/channels/cmd_llm.c b/src/channels/cmd_llm.c
+index efa211c..8d57094 100644
+--- a/src/channels/cmd_llm.c
++++ b/src/channels/cmd_llm.c
+@@ -47,7 +47,7 @@ static const router_preset_t g_router_presets[] = {
+     { "glm", "open.bigmodel.cn", "/api/paas/v4/chat/completions", "glm-4-flash", 1 },
+     { "openai", "api.openai.com", "/v1/chat/completions", "gpt-4o", 3 },
+     { "claude", "api.anthropic.com", "/v1/messages", "claude-sonnet-4-20250514", 3 },
+-    { "mimo", "token-plan-cn.xiaomimimo.com", "/v1/chat/completions", "mimo-v2.5", 1 },
++    { "mimo", "token-plan-cn.xiaomimimo.com", "/v1/chat/completions", "mimo-v2.6-flash", 1 },
+     { "openrouter", "openrouter.ai", "/api/v1/chat/completions",
+         "openrouter/hunter-alpha", 2 },
+     { NULL, NULL, NULL, NULL, 0 }
+@@ -69,7 +69,7 @@ void cmd_set_llm(int argc, char** argv)
+                "  glm      - open.bigmodel.cn  (glm-4-flash)\n"
+                "  openai   - api.openai.com  (gpt-4o)\n"
+                "  openrouter - openrouter.ai  (openrouter/hunter-alpha)\n"
+-               "  mimo     - token-plan-cn.xiaomimimo.com  (mimo-v2.5)\n"
++               "  mimo     - token-plan-cn.xiaomimimo.com  (mimo-v2.6-flash)\n"
+                "\n"
+                "URL format (for custom endpoints):\n"
+                "  set_llm http://host:port/path model key\n"
+diff --git a/src/infra/network_manager.c b/src/infra/network_manager.c
+index 71768df..9857e96 100644
+--- a/src/infra/network_manager.c
++++ b/src/infra/network_manager.c
+@@ -165,6 +165,12 @@ int network_wifi_reconnect(void)
+     return network_wait_connected(5000);
+ }
+ 
++int network_wifi_disconnect(const char* iface)
++{
++    (void)iface;
++    return system("ifdown eth0") == 0 ? OK : ERROR;
++}
++
+ #elif defined(CONFIG_AI_AGENT_NET_RPMSG)
+ /* ── RPMSG/TUN network via BLE proxy ─────────────────────────── */
+ 
+@@ -792,6 +798,12 @@ int network_wifi_reconnect(void)
+     return network_rpmsg_init();
+ }
+ 
++int network_wifi_disconnect(const char* iface)
++{
++    (void)iface;
++    return ERROR;
++}
++
+ #else
+ /* Real hardware: use the board-supported NuttX WAPI command sequence. */
+ #include "infra/config_store.h"
+@@ -891,4 +903,30 @@ int network_wifi_reconnect(void)
+     agent_config_get(AGENT_CFG_KEY_WIFI_PASS, pass, sizeof(pass));
+     return network_wifi_connect(NULL, ssid, pass);
+ }
++
++int network_wifi_disconnect(const char* iface)
++{
++    const char* dev = (iface && iface[0]) ? iface : "wlan0";
++    struct in_addr no_addr = { .s_addr = INADDR_ANY };
++    int sock;
++    int ret;
++
++    pthread_mutex_lock(&s_wifi_connect_mutex);
++    sock = wapi_make_socket();
++    if (sock < 0) {
++        pthread_mutex_unlock(&s_wifi_connect_mutex);
++        return ERROR;
++    }
++
++    ret = wapi_set_essid(sock, dev, "", WAPI_ESSID_OFF);
++    close(sock);
++    netlib_set_ipv4addr(dev, &no_addr);
++    netlib_set_dripv4addr(dev, &no_addr);
++    netlib_set_ipv4netmask(dev, &no_addr);
++    if (netlib_ifdown(dev) != OK)
++        ret = ERROR;
++    pthread_mutex_unlock(&s_wifi_connect_mutex);
++
++    return ret == OK ? OK : ERROR;
++}
+ #endif
+diff --git a/src/infra/network_manager.h b/src/infra/network_manager.h
+index 78f37d4..5244e99 100644
+--- a/src/infra/network_manager.h
++++ b/src/infra/network_manager.h
+@@ -52,6 +52,9 @@ int network_wifi_connect_boot(const char *iface, const char *ssid,
+ /** Re-connect using credentials saved in config_store (called at startup). */
+ int network_wifi_reconnect(void);
+ 
++/** Disconnect WiFi without deleting the saved credentials. */
++int network_wifi_disconnect(const char *iface);
++
+ /* ── RPMSG/TUN network interface ──────────────────────────────── */
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+ 
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index f04bdf2..83e939b 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -61,6 +61,8 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
+ 
+ static const char* TAG = "vela_tls";
+ 
++#define VELA_TLS_HANDSHAKE_TIMEOUT_SEC 15
++
+ /* ── Chunked transfer decoding ───────────────────────────────── */
+ 
+ /**
+@@ -212,6 +214,7 @@ static conn_slot_t* pool_acquire(const char* host, const char* port)
+     /* 2. Find an empty slot */
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
+         if (!s_pool[i].valid && !s_pool[i].in_use) {
++            s_pool[i].ctx.net.fd = -1;
+             s_pool[i].in_use = true;
+             pthread_mutex_unlock(&s_pool_lock);
+             return &s_pool[i];
+@@ -268,8 +271,21 @@ void vela_tls_pool_cleanup(void)
+     pthread_mutex_unlock(&s_pool_lock);
+ }
+ 
++void vela_tls_abort_active(void)
++{
++    pthread_mutex_lock(&s_pool_lock);
++    for (int i = 0; i < CONN_POOL_SIZE; i++) {
++        if (s_pool[i].in_use && s_pool[i].ctx.net.fd >= 0) {
++            shutdown(s_pool[i].ctx.net.fd, SHUT_RDWR);
++        }
++    }
++    pthread_mutex_unlock(&s_pool_lock);
++}
++
+ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+ {
++    int handshake_timeout_sec = VELA_TLS_HANDSHAKE_TIMEOUT_SEC;
++    int read_timeout_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC;
+     int ret;
+ 
+     mbedtls_ssl_init(&ctx->ssl);
+@@ -322,13 +338,19 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         if ((ret = mbedtls_net_connect(&ctx->net, host, port,
+                  MBEDTLS_NET_PROTO_TCP))
+             != 0) {
++            fprintf(stderr,
++                "[ai_agent] TCP connect %s:%s failed: mbedtls=-0x%04x errno=%d\n",
++                host, port, -ret, errno);
+             syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
+                 TAG, host, port, -ret);
+             return VELA_TLS_ERR_CONNECT;
+         }
+     }
+ 
+-    /* Force blocking mode and set socket-level read timeout.
++    /* Force blocking mode and use the shorter connect timeout while the TLS
++     * handshake is in progress.  A timed-out blocking recv is reported by
++     * mbedTLS as WANT_READ, so the handshake loop below also has an explicit
++     * deadline instead of retrying WANT_READ forever.
+      * This avoids using select()/poll() inside mbedtls_net_recv_timeout
+      * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
+      * Timeout is configured via AGENT_LLM_SOCKET_TIMEOUT_SEC in
+@@ -337,21 +359,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+     mbedtls_net_set_block(&ctx->net);
+     if (ctx->net.fd >= 0) {
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+-        int read_timeout_sec = network_get_read_timeout();
+-        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
+-#else
+-        struct timeval tv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
+-            .tv_usec = 0 };
++        handshake_timeout_sec = network_get_connect_timeout();
++        read_timeout_sec = network_get_read_timeout();
+ #endif
++        struct timeval tv = { .tv_sec = handshake_timeout_sec,
++            .tv_usec = 0 };
+         setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+-
+-#ifdef CONFIG_AI_AGENT_NET_RPMSG
+-        {
+-            int timeout_sec = network_get_connect_timeout();
+-            struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
+-            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+-        }
+-#endif
++        setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+     }
+ 
+     /* SSL config: client, TLS, default ciphersuites */
+@@ -412,7 +426,25 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         mbedtls_net_send, mbedtls_net_recv, NULL);
+ 
+     /* Handshake */
++    struct timespec handshake_deadline;
++    clock_gettime(CLOCK_MONOTONIC, &handshake_deadline);
++    handshake_deadline.tv_sec += handshake_timeout_sec;
+     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
++        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
++            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
++            struct timespec current_time;
++
++            clock_gettime(CLOCK_MONOTONIC, &current_time);
++            if (current_time.tv_sec > handshake_deadline.tv_sec ||
++                (current_time.tv_sec == handshake_deadline.tv_sec &&
++                 current_time.tv_nsec >= handshake_deadline.tv_nsec)) {
++                syslog(LOG_ERR, "[%s] TLS handshake timed out after %ds\n",
++                    TAG, handshake_timeout_sec);
++                return VELA_TLS_ERR_HANDSHAKE;
++            }
++            continue;
++        }
++
+         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+ #if defined(MBEDTLS_ERROR_C)
+             char err_buf[128];
+@@ -429,6 +461,12 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         }
+     }
+ 
++    if (ctx->net.fd >= 0) {
++        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
++
++        setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++    }
++
+     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
+         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+ 
+diff --git a/src/infra/vela_tls.h b/src/infra/vela_tls.h
+index 8e52bf6..a07b408 100644
+--- a/src/infra/vela_tls.h
++++ b/src/infra/vela_tls.h
+@@ -115,6 +115,11 @@ int vela_https_head_date(const char *host, const char *port, const char *path,
+  */
+ void vela_tls_pool_cleanup(void);
+ 
++/* Interrupt sockets currently owned by HTTPS requests.  The request remains
++ * responsible for unwinding and releasing its pool slot normally. */
++
++void vela_tls_abort_active(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index b775608..14f7abf 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -56,6 +56,16 @@ bool is_openai_compat_host(const char* host)
+         || strstr(host, "xiaomimimo.com");
+ }
+ 
++/* MiMo Token Plan follows the OpenAI-compatible request body, but its
++ * gateway authenticates with `api-key: <key>` instead of
++ * `Authorization: Bearer <key>`.  Keep Bearer authentication for every
++ * other provider.
++ */
++static bool is_xiaomi_mimo_host(const char* host)
++{
++    return host && strstr(host, "xiaomimimo.com") != NULL;
++}
++
+ 
+ static void add_mimo_thinking_disabled(cJSON* body, const char* host)
+ {
+@@ -269,9 +279,13 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
+     if (resp_buf_init(rb, raw_cap) != OK)
+         return ERROR;
+ 
+-    /* OpenAI-compatible format: Authorization: Bearer <key> */
++    /* MiMo Token Plan requires the raw key in an api-key header. */
++    const bool mimo_auth = is_xiaomi_mimo_host(llm_host);
+     char auth_header[256];
+-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
++    if (mimo_auth)
++        snprintf(auth_header, sizeof(auth_header), "%s", api_key);
++    else
++        snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
+ 
+     /* Extract provider ID from model string (e.g. "xiaomi/mimo-claw-0301" →
+      * "xiaomi") Mify gateway requires X-Model-Provider-Id header for routing. */
+@@ -284,7 +298,8 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
+         memcpy(provider, model, plen);
+     }
+ 
+-    vela_header_t hdrs[] = { { "Authorization", auth_header },
++    vela_header_t hdrs[] = { { mimo_auth ? "api-key" : "Authorization",
++                                  auth_header },
+         { provider[0] ? "X-Model-Provider-Id" : NULL,
+             provider[0] ? provider : NULL },
+         { NULL, NULL } };
+@@ -301,6 +316,8 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
+     }
+ 
+     if (status < 0) {
++        fprintf(stderr, "[ai_agent] MiMo HTTPS failed at %s:%s%s: %d\n",
++            llm_host, llm_port, llm_path, status);
+         resp_buf_free(rb);
+         return ERROR;
+     }
+@@ -335,8 +352,12 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
+         return ERROR;
+ 
+     int body_len = (int)strlen(post_data);
++    const bool mimo_auth = is_xiaomi_mimo_host(llm_host);
+     char auth_header[256];
+-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
++    if (mimo_auth)
++        snprintf(auth_header, sizeof(auth_header), "%s", api_key);
++    else
++        snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
+ 
+     /* Extract provider ID from model (e.g. "xiaomi/mimo-claw-0301" → "xiaomi") */
+     char provider_hdr[128] = { 0 };
+@@ -356,11 +377,12 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
+         "POST %s HTTP/1.1\r\n"
+         "Host: %s\r\n"
+         "Content-Type: application/json\r\n"
+-        "Authorization: %s\r\n"
++        "%s: %s\r\n"
+         "%s"
+         "Content-Length: %d\r\n"
+         "Connection: close\r\n\r\n",
+-        llm_path, llm_host, auth_header, provider_hdr, body_len);
++        llm_path, llm_host, mimo_auth ? "api-key" : "Authorization",
++        auth_header, provider_hdr, body_len);
+ 
+     if (proxy_conn_write(conn, header, hlen) < 0 || proxy_conn_write(conn, post_data, body_len) < 0) {
+         proxy_conn_close(conn);
+-- 
+2.25.1
+

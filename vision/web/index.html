@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>盲道视觉识别 · 调试台</title>
+<style>
+  :root {
+    --bg: #0e1013;
+    --panel: #171a1f;
+    --panel-2: #1e2228;
+    --line: #2a2f37;
+    --text: #e6e9ee;
+    --muted: #8b93a1;
+    --accent: #5ad1a0;
+    --warn: #f0b45a;
+    --danger: #ef6b6b;
+    --info: #63b8ff;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 3px 9px;
+    border-radius: 999px; background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--line);
+  }
+  .pill.ok { color: var(--accent); border-color: #26543f; }
+  .pill.bad { color: var(--danger); border-color: #5c2a2a; }
+  .spacer { flex: 1; }
+
+  main {
+    display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(340px, 1fr);
+    gap: 16px; padding: 16px 20px 24px; align-items: start;
+  }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; overflow: hidden;
+  }
+  .card h2 {
+    margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 600;
+    color: var(--muted); letter-spacing: .08em; text-transform: uppercase;
+    border-bottom: 1px solid var(--line); background: var(--panel-2);
+  }
+  .card .body { padding: 12px 14px; }
+
+  .video-wrap { position: relative; background: #000; line-height: 0; }
+  .video-wrap img { width: 100%; display: block; }
+  .video-overlay-note {
+    position: absolute; left: 10px; bottom: 10px; font-family: var(--mono);
+    font-size: 11px; background: #000a; padding: 4px 8px; border-radius: 6px;
+    color: var(--muted);
+  }
+
+  .state-big {
+    font-family: var(--mono); font-size: 22px; font-weight: 700;
+    letter-spacing: .04em; margin-bottom: 6px;
+  }
+  .state-reason { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-family: var(--mono); font-size: 12.5px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { text-align: right; }
+
+  .alerts { display: flex; flex-direction: column; gap: 6px; }
+  .alert-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    font-family: var(--mono); font-size: 12.5px;
+    padding: 6px 10px; border-radius: 6px;
+    background: #2a2320; border-left: 3px solid var(--warn);
+  }
+  .alert-row.high { background: #2c1f1f; border-left-color: var(--danger); }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 12.5px; font-style: italic; }
+
+  #timeline { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .tl-item {
+    font-size: 12.5px; padding: 6px 10px; border-radius: 6px;
+    background: var(--panel-2); border-left: 3px solid var(--accent);
+  }
+  .tl-item .t { font-family: var(--mono); color: var(--muted); font-size: 11px; margin-right: 8px; }
+
+  form.controls { display: grid; gap: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label { color: var(--muted); font-size: 12px; min-width: 74px; }
+  label.inline { min-width: auto; display: inline-flex; align-items: center; gap: 5px; }
+  .hint {
+    margin: 0; padding: 9px 12px; border-radius: 8px; font-size: 12.5px;
+    line-height: 1.65; color: #a9b3c2;
+    background: #14181d; border: 1px solid var(--line); border-left: 3px solid var(--info);
+  }
+  .hint code {
+    font-family: var(--mono); font-size: 11.5px;
+    background: #0c0e11; padding: 1px 5px; border-radius: 4px;
+  }
+  input[type=text], input[type=number] {
+    flex: 1; min-width: 90px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: #3d444f; }
+  button.primary { background: #1e4d3a; border-color: #2b6b50; color: #bff0da; }
+  button.primary:hover { background: #235c45; }
+
+  pre#raw {
+    margin: 0; padding: 12px 14px; max-height: 320px; overflow: auto;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    color: #b9c4d4; background: #0c0e11;
+  }
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; padding: 10px 16px; border-radius: 8px;
+    background: var(--panel-2); border: 1px solid var(--line); font-size: 13px;
+    opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>盲道视觉识别 · 调试台</h1>
+  <span class="pill" id="pill-source">源: -</span>
+  <span class="pill" id="pill-fps">FPS: -</span>
+  <span class="pill" id="pill-srcfps" title="流本身每秒到达多少帧。明显高于处理 FPS 说明是处理端慢；两者都低说明是采集/网络慢">源FPS: -</span>
+  <span class="pill" id="pill-skipped" title="因为处理不过来而被跳过的帧数">跳过: -</span>
+  <span class="pill" id="pill-schema">schema: -</span>
+  <span class="spacer"></span>
+  <span class="pill" id="pill-health">连接中…</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>实时画面（服务端叠加）</h2>
+    <div class="video-wrap">
+      <img id="live" src="/stream.mjpg" alt="等待画面…">
+      <div class="video-overlay-note" id="res">-</div>
+    </div>
+  </section>
+
+  <div style="display:grid; gap:16px;">
+    <section class="card">
+      <h2>引导状态</h2>
+      <div class="body">
+        <div class="state-big" id="state">—</div>
+        <div class="state-reason" id="state-reason">—</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>警报</h2>
+      <div class="body"><div class="alerts" id="alerts"><span class="empty">无</span></div></div>
+    </section>
+
+    <section class="card">
+      <h2>关键指标</h2>
+      <div class="body">
+        <div class="kv">
+          <span class="k">盲道</span><span class="v" id="k-present">—</span>
+          <span class="k">砖型</span><span class="v" id="k-tile">—</span>
+          <span class="k">横向偏移</span><span class="v" id="k-offset">—</span>
+          <span class="k">航向角</span><span class="v" id="k-heading">—</span>
+          <span class="k">盲道范围</span><span class="v" id="k-range">—</span>
+          <span class="k">提示砖</span><span class="v" id="k-warn">—</span>
+          <span class="k">障碍物</span><span class="v" id="k-obstacles">—</span>
+          <span class="k">斑马线</span><span class="v" id="k-crosswalk">—</span>
+          <span class="k">红绿灯</span><span class="v" id="k-light">—</span>
+          <span class="k">台阶</span><span class="v" id="k-stairs">—</span>
+          <span class="k">延迟</span><span class="v" id="k-latency">—</span>
+          <span class="k">画面质量</span><span class="v" id="k-quality">—</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>播报时间线</h2>
+      <div class="body"><div id="timeline"><span class="empty">还没有播报</span></div></div>
+    </section>
+  </div>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>控制</h2>
+    <div class="body">
+      <form class="controls" id="form">
+        <div class="row">
+          <label for="source">帧源</label>
+          <input type="text" id="source" placeholder="mjpeg:http://192.168.1.20/stream / file:xxx.mp4 / usb:0">
+          <button type="button" class="primary" id="btn-source">切换</button>
+        </div>
+        <div class="row">
+          <label>标定</label>
+          <input type="number" id="height" step="0.01" placeholder="离地高度 m">
+          <input type="number" id="pitch" step="0.1" placeholder="俯仰角 deg">
+          <input type="number" id="hfov" step="0.1" placeholder="水平视场 deg">
+          <button type="button" class="primary" id="btn-calib">应用</button>
+          <button type="button" id="btn-save-calib">保存为 calibration.json</button>
+        </div>
+        <p class="hint">
+          <b>怎么标定</b>：画面上的<b style="color:#46c864">绿线</b>是地面上"前方 1 / 2 / 3 / 5 米"的位置，
+          <b style="color:#78a9ff">蓝线</b>是正前方中线，紫线是横向 ±0.5 / ±1 米。
+          改「离地高度」和「俯仰角」，点「应用」，让这些线跟真实地面重合——
+          比如让一个人站在正前方 2 米，<code>2.0m</code> 那条绿线应该正好落在他脚下。
+          调好后点「保存为 calibration.json」，下次启动加 <code>--config calibration.json</code>。
+        </p>
+        <div class="row">
+          <label>显示</label>
+          <label class="inline"><input type="checkbox" id="grid" checked> 地面网格</label>
+          <button type="button" id="btn-reset">清空时序/播报状态</button>
+          <button type="button" id="btn-shot">保存快照</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>原始 Scene JSON</h2>
+    <pre id="raw">—</pre>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+function fmt(v, digits = 2, suffix = '') {
+  if (v === null || v === undefined) return '—';
+  return Number(v).toFixed(digits) + suffix;
+}
+
+function renderAlerts(alerts) {
+  const box = $('alerts');
+  const items = (alerts && alerts.alerts) || [];
+  const parts = items.map(a => {
+    const cls = a.priority >= 90 ? 'alert-row high' : 'alert-row';
+    const dist = a.distance_m === null ? '' : ` · ${fmt(a.distance_m, 2)} m`;
+    return `<div class="${cls}"><span>${a.kind}</span><span class="muted">${a.detail || ''}${dist}</span></div>`;
+  });
+  if (alerts && alerts.on_warning_tile) {
+    parts.push('<div class="alert-row"><span>脚下提示砖</span><span class="muted">位置状态</span></div>');
+  }
+  box.innerHTML = parts.length ? parts.join('') : '<span class="empty">无</span>';
+}
+
+let lastFrame = -1;
+
+function render(scene) {
+  if (!scene || scene.frame === undefined) return;
+  lastFrame = scene.frame;
+
+  const t = scene.tactile || {};
+  const tr = scene.tracker || {};
+  const q = scene.quality || {};
+  const obs = scene.obstacles || {};
+  const cw = scene.crosswalk || {};
+  const tl = scene.traffic_light || {};
+  const st = scene.stairs || {};
+
+  $('state').textContent = scene.state || '—';
+  $('state').style.color =
+    (scene.state || '').includes('TURN') ? '#63b8ff' :
+    (scene.state || '').includes('DRIFT') ? '#f0b45a' :
+    (scene.state || '') === 'PATH_LOST' ? '#ef6b6b' : '#5ad1a0';
+  $('state-reason').textContent = scene.state_reason || '—';
+
+  $('k-present').textContent = t.present ? '有' : '无';
+  $('k-tile').textContent = (t.tile_type || '—') + (t.tile_type_conf ? ` (${fmt(t.tile_type_conf)})` : '');
+  $('k-offset').textContent = fmt(tr.offset_m, 2, ' m');
+  $('k-heading').textContent = fmt(tr.heading_deg, 1, '°');
+  $('k-range').textContent = (tr.near_m == null) ? '—' : `${fmt(tr.near_m, 2)} – ${fmt(tr.far_m, 2)} m`;
+  $('k-warn').textContent = t.warning_near_m == null ? '无' : fmt(t.warning_near_m, 2, ' m');
+  $('k-obstacles').textContent = obs.count ? `${obs.count} 个 · 最近 ${fmt(obs.nearest_m, 1)} m` : '无';
+  $('k-crosswalk').textContent = cw.present ? `有 (${cw.bar_count} 条, ${fmt(cw.confidence)})` : '无';
+  $('k-light').textContent = tl.present ? `${tl.state} (${fmt(tl.conf)})` : '无';
+  $('k-stairs').textContent = st.suspected ? `疑似 ${fmt(st.distance_m, 1)} m` : '无';
+  $('k-latency').textContent = scene.latency_ms ? `${fmt(scene.latency_ms.total, 1)} ms` : '—';
+  $('k-quality').textContent = q.ok ? '正常' : (q.warnings || []).join(', ');
+
+  renderAlerts(scene.alerts);
+  $('raw').textContent = JSON.stringify(scene, null, 2);
+
+  $('pill-fps').textContent = 'FPS: ' + (scene.fps == null ? '—' : fmt(scene.fps, 1));
+  $('pill-schema').textContent = 'schema: ' + (scene.schema_problems ? '不合法' : 'ok');
+  $('pill-schema').className = 'pill ' + (scene.schema_problems ? 'bad' : 'ok');
+
+  const src = scene.source || {};
+  $('pill-source').textContent = '源: ' + (src.type || '—');
+  if (src.size && src.size[0]) $('res').textContent = `${src.size[0]}×${src.size[1]}`;
+}
+
+/* ---------- SSE：逐帧 JSON ---------- */
+function connectEvents() {
+  const es = new EventSource('/events');
+  es.onmessage = (e) => {
+    try { render(JSON.parse(e.data)); } catch (err) { console.error(err); }
+  };
+  es.addEventListener('speech', (e) => {
+    try { addTimeline(JSON.parse(e.data)); } catch (err) { console.error(err); }
+  });
+  es.onerror = () => { $('pill-health').textContent = 'SSE 断开，重连中'; $('pill-health').className = 'pill bad'; };
+  es.onopen = () => { $('pill-health').textContent = '已连接'; $('pill-health').className = 'pill ok'; };
+}
+connectEvents();
+
+/* ---------- 时间线 ---------- */
+const tlSeen = new Set();
+function addTimeline(ev) {
+  if (!ev || !ev.text) return;
+  const key = `${ev.ts}|${ev.text}`;
+  if (tlSeen.has(key)) return;
+  tlSeen.add(key);
+  const box = $('timeline');
+  if (box.querySelector('.empty')) box.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'tl-item';
+  const d = new Date((ev.ts || 0) * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  div.innerHTML = `<span class="t">${hh}:${mm}:${ss}</span>${ev.text}`;
+  box.prepend(div);
+  while (box.children.length > 60) box.lastChild.remove();
+}
+
+/* ---------- 健康检查 ---------- */
+async function pollHealth() {
+  try {
+    const r = await fetch('/health');
+    const h = await r.json();
+    $('pill-health').textContent = h.ok ? '运行中' : '无新帧';
+    $('pill-health').className = 'pill ' + (h.ok ? 'ok' : 'bad');
+
+    $('pill-srcfps').textContent = '源FPS: ' +
+      (h.source_fps == null ? '—' : Number(h.source_fps).toFixed(1));
+    $('pill-skipped').textContent = '跳过: ' + (h.frames_skipped == null ? '—' : h.frames_skipped);
+
+    // 直接告诉用户瓶颈在哪
+    if (h.source_fps && h.fps) {
+      const ratio = h.source_fps / Math.max(0.1, h.fps);
+      $('pill-srcfps').className = 'pill ' + (ratio > 1.4 ? 'bad' : 'ok');
+      $('pill-srcfps').title = ratio > 1.4
+        ? `处理端是瓶颈：流有 ${h.source_fps} 帧/秒，只处理了 ${h.fps} 帧/秒。`
+          + '可以用 --imgsz 416 或 --width-limit 0 降低开销'
+        : '采集/网络是瓶颈：源帧率本身就不高，检查 WiFi 信号或降 jpeg_quality';
+    }
+    if (h.reader_errors) {
+      $('pill-skipped').className = 'pill bad';
+      $('pill-skipped').title = `抽取线程出错 ${h.reader_errors} 次`;
+    }
+
+    if (h.camera) {
+      $('height').value = h.camera.height_m;
+      $('pitch').value = h.camera.pitch_deg;
+      $('res').textContent = `${h.camera.frame[0]}×${h.camera.frame[1]} · visible Z ${h.camera.visible_ground_z_m[0]}–${h.camera.visible_ground_z_m[1]} m`;
+    }
+  } catch (e) {
+    $('pill-health').textContent = '服务不可达';
+    $('pill-health').className = 'pill bad';
+  }
+}
+pollHealth();
+setInterval(pollHealth, 3000);
+
+/* ---------- 控制按钮 ---------- */
+$('btn-source').onclick = async () => {
+  const source = $('source').value.trim();
+  if (!source) return toast('请填写帧源');
+  const r = await fetch('/source', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source })
+  });
+  const j = await r.json();
+  toast(j.ok ? '已切换帧源' : ('失败: ' + j.error));
+  if (j.ok) $('live').src = '/stream.mjpg?t=' + Date.now();
+};
+
+$('btn-calib').onclick = async () => {
+  const patch = { camera: {}, show_ground_grid: $('grid').checked };
+  const h = $('height').value, p = $('pitch').value, f = $('hfov').value;
+  if (h) patch.camera.height_m = Number(h);
+  if (p) patch.camera.pitch_deg = Number(p);
+  if (f) patch.camera.hfov_deg = Number(f);
+  const r = await fetch('/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch)
+  });
+  toast((await r.json()).ok ? '标定已应用，看网格对齐了没' : '应用失败');
+};
+
+$('btn-save-calib').onclick = async () => {
+  const r = await fetch('/config/save', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: 'calibration.json' })
+  });
+  const j = await r.json();
+  toast(j.ok ? ('已保存到 ' + j.path) : ('保存失败: ' + j.error));
+};
+
+$('grid').onchange = async () => {
+  await fetch('/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ show_ground_grid: $('grid').checked })
+  });
+};
+
+/* 启动时读一次当前配置，填进输入框 */
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const c = await r.json();
+    if (c && c.camera) {
+      $('height').value = c.camera.height_m;
+      $('pitch').value = c.camera.pitch_deg;
+      $('hfov').value = c.camera.hfov_deg;
+    }
+    if (c && typeof c.show_ground_grid === 'boolean') {
+      $('grid').checked = c.show_ground_grid;
+    }
+  } catch (e) { /* 忽略 */ }
+}
+loadConfig();
+
+$('btn-reset').onclick = async () => {
+  await fetch('/reset', { method: 'POST' });
+  toast('时序与播报状态已清空');
+};
+
+$('btn-shot').onclick = () => {
+  const a = document.createElement('a');
+  a.href = '/snapshot.jpg?t=' + Date.now();
+  a.download = 'vision-' + Date.now() + '.jpg';
+  a.click();
+};
+</script>
+</body>
+</html>

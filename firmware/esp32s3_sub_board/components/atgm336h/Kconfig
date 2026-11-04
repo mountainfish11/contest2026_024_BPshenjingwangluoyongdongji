@@ -1,0 +1,31 @@
+menu "ATGM336H GNSS Configuration"
+
+    config ATGM336H_UART_NUM
+        int "UART controller"
+        range 1 2
+        default 1
+
+    config ATGM336H_UART_BAUD_RATE
+        int "UART baud rate"
+        range 4800 115200
+        default 9600
+        help
+            ATGM336H-5N defaults to 9600 baud. Some newer ATGM336H
+            variants default to 115200 baud.
+
+    config ATGM336H_UART_RX_GPIO
+        int "Module TXD to controller RX GPIO"
+        range 0 48
+        default 4
+
+    config ATGM336H_UART_TX_GPIO
+        int "Module RXD from controller TX GPIO"
+        range 0 48
+        default 5
+
+    config ATGM336H_PPS_GPIO
+        int "1PPS input GPIO"
+        range 0 48
+        default 6
+
+endmenu

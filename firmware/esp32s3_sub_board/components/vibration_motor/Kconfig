@@ -1,0 +1,15 @@
+menu "1027 Vibration Motor Configuration"
+
+    config VIBRATION_MOTOR_GPIO
+        int "Motor driver control GPIO"
+        default 11
+        range 0 48
+        help
+            GPIO connected to the gate/base input of the external motor
+            driver.  Never connect the motor directly to this GPIO.
+
+    config VIBRATION_MOTOR_ACTIVE_HIGH
+        bool "Motor driver is active high"
+        default y
+
+endmenu
