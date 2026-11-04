@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_024_BPshenjingwangluoyongdongji",
+  "github_login": "mountainfish11",
+  "generator": "backfill-codex@codex",
+  "sessions": [
+    {
+      "session_id": "01a0b3c9-4f27-75b2-a5b6-7acf32304a60",
+      "tool": "codex",
+      "started_at": "2026-09-18T09:28:24.692Z",
+      "last_event_at": "2026-10-15T07:10:15.308Z",
+      "event_count": 146,
+      "file_path": "logs/mountainfish11/2026-09-18/codex__01a0b3c9-4f27-75b2-a5b6-7acf32304a60.jsonl",
+      "collection_mode": "backfill-sqlite",
+      "health": "ok",
+      "source_integrity": {
+        "main_sha256": "af90943cde966b4faa9dc9a2c8b39bc2943fb3b8396b6ceaaf1d95801f69e094",
+        "main_size": 11973704,
+        "captured_at": "2026-11-04T11:11:22.550483+00:00"
+      }
+    },
+    {
+      "session_id": "01a1a1b4-1bd1-75a2-9716-cea417522064",
+      "tool": "codex",
+      "started_at": "2026-11-03T13:58:32.880Z",
+      "last_event_at": "2026-11-03T13:58:32.896Z",
+      "event_count": 2,
+      "file_path": "logs/mountainfish11/2026-11-03/codex__01a1a1b4-1bd1-75a2-9716-cea417522064.jsonl",
+      "collection_mode": "backfill-sqlite",
+      "health": "ok",
+      "source_integrity": {
+        "main_sha256": "6efe80d809fba839b0183dbdce983bb8667243d323b438d6139c7a76926b1212",
+        "main_size": 241101,
+        "captured_at": "2026-11-04T11:11:22.800080+00:00"
+      }
+    }
+  ],
+  "updated_at": "2026-11-04T11:11:22.803921+00:00"
+}

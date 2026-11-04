@@ -1,0 +1,28 @@
+From 0b42a03bc909adf920bf1e908d992fded44a4a40 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Wed, 4 Nov 2026 00:29:51 +0800
+Subject: [PATCH 5/6] fix: tolerate transient TLS receive timeouts
+
+---
+ src/infra/vela_tls.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index 8e4d737..fadcbe5 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -572,7 +572,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+     handshake_deadline.tv_sec += request_timeout_sec;
+     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+         if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+-            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
++            ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
++            (ret == MBEDTLS_ERR_NET_RECV_FAILED &&
++             (errno == EAGAIN || errno == EWOULDBLOCK ||
++              errno == ETIMEDOUT))) {
+             struct timespec current_time;
+ 
+             clock_gettime(CLOCK_MONOTONIC, &current_time);
+-- 
+2.25.1
+

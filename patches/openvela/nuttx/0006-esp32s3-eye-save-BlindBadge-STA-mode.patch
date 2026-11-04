@@ -1,0 +1,256 @@
+From a968d8b4e87b9c8545ca37329124ee4ebc9a6afb Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Thu, 29 Oct 2026 14:20:17 +0800
+Subject: [PATCH 6/9] esp32s3-eye: save BlindBadge STA mode
+
+---
+ arch/xtensa/src/esp32s3/esp32s3_cam.c         | 11 ---
+ arch/xtensa/src/esp32s3/esp32s3_wlan.c        | 18 ----
+ .../esp32s3-eye/configs/blindbadge/defconfig  |  3 +-
+ .../esp32s3-eye/src/esp32s3_board_camera.c    | 83 +++++++++++++++++--
+ 4 files changed, 79 insertions(+), 36 deletions(-)
+
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index 298e6aa2080..8d215b96c5b 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -489,17 +489,6 @@ release_slot:
+ 
+   if (priv->stat_frames >= ESP32S3_CAM_STATS_FRAMES)
+     {
+-      printf("CAM: timing frames=%" PRIu32 " arm_first_avg_us=%" PRIu64
+-             " frame_avg_us=%" PRIu64 " irq_work_avg_us=%" PRIu64
+-             " restart_avg_us=%" PRIu64 " process_avg_us=%" PRIu64
+-             " restart_failures=%" PRIu32 "\n",
+-             priv->stat_frames,
+-             priv->stat_arm_first_us / priv->stat_frames,
+-             priv->stat_frame_us / priv->stat_frames,
+-             priv->stat_irq_work_us / priv->stat_frames,
+-             priv->stat_restart_us / priv->stat_frames,
+-             priv->stat_process_us / priv->stat_frames,
+-             priv->stat_restart_failures);
+       priv->stat_frames = 0;
+       priv->stat_restart_failures = 0;
+       priv->stat_arm_first_us = 0;
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wlan.c b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+index 287e1cae8f8..5f44f7bb60d 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wlan.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+@@ -521,30 +521,12 @@ static struct wlan_pktbuf *wlan_txframe(struct wlan_priv_s *priv)
+ 
+ static void wlan_transmit(struct wlan_priv_s *priv)
+ {
+-  static bool tx_nomem_active;
+   struct wlan_pktbuf *pktbuf;
+   int ret;
+ 
+   while ((pktbuf = wlan_txframe(priv)))
+     {
+       ret = priv->ops->send(pktbuf->buffer, pktbuf->len);
+-      if (ret == -ENOMEM && !tx_nomem_active)
+-        {
+-          struct mallinfo info = kmm_mallinfo();
+-
+-          tx_nomem_active = true;
+-          printf("[wlan-tx] ENOMEM heap free=%u largest=%u used=%u\n",
+-                 info.fordblks, info.mxordblk, info.uordblks);
+-        }
+-      else if (ret >= 0 && tx_nomem_active)
+-        {
+-          struct mallinfo info = kmm_mallinfo();
+-
+-          tx_nomem_active = false;
+-          printf("[wlan-tx] recovered heap free=%u largest=%u used=%u\n",
+-                 info.fordblks, info.mxordblk, info.uordblks);
+-        }
+-
+       if (ret == -ENOMEM)
+         {
+           wlan_add_txpkt_head(priv, pktbuf);
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+index 00b393b2665..59b6a86c6ae 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
++++ b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+@@ -74,7 +74,6 @@ CONFIG_ESP32S3_SPIRAM=y
+ CONFIG_ESP32S3_SPIRAM_MODE_OCT=y
+ CONFIG_ESP32S3_USBSERIAL=y
+ CONFIG_ESP32S3_WIFI=y
+-CONFIG_ESP32S3_WIFI_SOFTAP=y
+ CONFIG_ESPRESSIF_SILENT_BOOT=y
+ CONFIG_ETC_ROMFS=y
+ CONFIG_EXAMPLES_AI_AGENT_VELA=y
+@@ -85,6 +84,7 @@ CONFIG_EXAMPLES_RANDOM=y
+ CONFIG_FS_PROCFS=y
+ CONFIG_FS_ROMFS=y
+ CONFIG_FS_TMPFS=y
++CONFIG_I2C_RESET=y
+ CONFIG_IDLETHREAD_STACKSIZE=3072
+ CONFIG_INIT_ENTRYPOINT="nsh_main"
+ CONFIG_INIT_STACKSIZE=8192
+@@ -143,6 +143,7 @@ CONFIG_PTHREAD_MUTEX_TYPES=y
+ CONFIG_RAM_SIZE=114688
+ CONFIG_RAM_START=0x20000000
+ CONFIG_RR_INTERVAL=200
++CONFIG_SCHED_HPWORKPRIORITY=254
+ CONFIG_SCHED_LPWORK=y
+ CONFIG_SCHED_WAITPID=y
+ CONFIG_SIG_DEFAULT=y
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index 30f02aef51c..6c58f202661 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -45,6 +45,8 @@
+ #define OV2640_I2C_BUS 0
+ #define OV2640_I2C_FREQ 100000
+ #define OV2640_CLKRC_BALANCED 0x82
++#define OV2640_INIT_ATTEMPTS 3
++#define OV2640_RETRY_DELAY_MS 100
+ 
+ #define VGA_WIDTH 640
+ #define VGA_HEIGHT 480
+@@ -63,6 +65,7 @@ struct ov2640_regval_s {
+  ****************************************************************************/
+ 
+ static bool g_ov2640_initialized;
++static bool g_ov2640_xclk_started;
+ 
+ /* Phase 1: Soft reset */
+ 
+@@ -391,21 +394,30 @@ static bool ov2640_is_available(FAR struct imgsensor_s* sensor)
+     return true;
+ }
+ 
+-static void ov2640_start_xclk(void)
++static int ov2640_start_xclk(void)
+ {
+     FAR struct pwm_lowerhalf_s *pwm;
+     struct pwm_info_s info;
+     int ret;
+ 
++    if (g_ov2640_xclk_started)
++      {
++        return OK;
++      }
++
+     pwm = esp32s3_ledc_init(0);
+     if (pwm == NULL) {
+         syslog(LOG_ERR, "CAM: LEDC init failed\n");
+         printf("CAM: LEDC init failed\n");
+-        return;
++        return -ENODEV;
+     }
+ 
+     ret = pwm->ops->setup(pwm);
+     printf("CAM: XCLK setup ret=%d\n", ret);
++    if (ret < 0)
++      {
++        return ret;
++      }
+ 
+     info.frequency = 20000000;
+     info.duty = (ub16_t)(65536 / 2);
+@@ -414,12 +426,20 @@ static void ov2640_start_xclk(void)
+     printf("CAM: XCLK start ret=%d frequency=%lu pin=%d\n",
+            ret, (unsigned long)info.frequency,
+            CONFIG_ESP32S3_LEDC_CHANNEL0_PIN);
++    if (ret < 0)
++      {
++        return ret;
++      }
++
++    g_ov2640_xclk_started = true;
+     syslog(LOG_INFO, "CAM: LEDC XCLK 20MHz started on GPIO15\n");
++    return OK;
+ }
+ 
+ static int ov2640_init(FAR struct imgsensor_s *sensor)
+ {
+     FAR struct i2c_master_s* i2c;
++    int attempt;
+     int ret;
+ 
+     if (g_ov2640_initialized) {
+@@ -428,7 +448,13 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+     }
+ 
+     printf("CAM: OV2640 init begin\n");
+-    ov2640_start_xclk();
++    ret = ov2640_start_xclk();
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "CAM: XCLK start failed: %d\n", ret);
++        return ret;
++      }
++
+     syslog(LOG_INFO, "CAM: LEDC XCLK started on GPIO15\n");
+     up_mdelay(50);
+ 
+@@ -440,9 +466,48 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+         return -ENODEV;
+     }
+ 
++    /* I2C0 is registered during board bring-up and then shared with the
++     * camera.  Clear any controller or bus state left across a chip reset
++     * before issuing the sensor's first SCCB transaction.
++     */
++
++    ret = I2C_RESET(i2c);
++    printf("CAM: I2C%d reset ret=%d\n", OV2640_I2C_BUS, ret);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "CAM: I2C%d reset failed: %d\n",
++               OV2640_I2C_BUS, ret);
++        return ret;
++      }
++
++    up_mdelay(10);
++
+ #ifdef CONFIG_OV2640_JPEG
+-    ret = ov2640_initialize(i2c);
+-    printf("CAM: ov2640_initialize ret=%d\n", ret);
++    for (attempt = 1; attempt <= OV2640_INIT_ATTEMPTS; attempt++)
++      {
++        ret = ov2640_initialize(i2c);
++        printf("CAM: ov2640_initialize attempt=%d ret=%d\n",
++               attempt, ret);
++        if (ret >= 0)
++          {
++            break;
++          }
++
++        if (attempt < OV2640_INIT_ATTEMPTS)
++          {
++            int reset_ret = I2C_RESET(i2c);
++
++            printf("CAM: OV2640 retry I2C reset ret=%d\n", reset_ret);
++            if (reset_ret < 0)
++              {
++                ret = reset_ret;
++                break;
++              }
++
++            up_mdelay(OV2640_RETRY_DELAY_MS);
++          }
++      }
++
+     if (ret < 0)
+       {
+         syslog(LOG_ERR, "CAM: ov2640_initialize failed: %d\n", ret);
+@@ -607,7 +672,13 @@ int board_camera_initialize(void)
+         return -ENODEV;
+     }
+ 
+-    ov2640_start_xclk();
++    ret = ov2640_start_xclk();
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "ERROR: camera XCLK start failed: %d\n", ret);
++        return ret;
++      }
++
+     syslog(LOG_INFO, "CAM: T3 LEDC XCLK started\n");
+ 
+     imgdata_register(imgdata);
+-- 
+2.25.1
+

@@ -1,0 +1,27 @@
+From 792b2d2d68deec95d4891b02cdefa6a02698035e Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Wed, 4 Nov 2026 08:56:33 +0800
+Subject: [PATCH 9/9] esp32s3-eye: expand BlindBadge TCP connection pool
+
+---
+ boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+index 0b97aec5da6..75513c4293f 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
++++ b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+@@ -132,7 +132,10 @@ CONFIG_NET_STATISTICS=y
+ CONFIG_NET_TCP=y
+ CONFIG_NET_TCPBACKLOG=y
+ CONFIG_NET_TCPPROTO_OPTIONS=y
++CONFIG_NET_TCP_ALLOC_CONNS=1
+ CONFIG_NET_TCP_DELAYED_ACK=y
++CONFIG_NET_TCP_MAX_CONNS=32
++CONFIG_NET_TCP_WAIT_TIMEOUT=30
+ CONFIG_NET_TCP_WRITE_BUFFERS=y
+ CONFIG_NET_UDP=y
+ CONFIG_NET_UDP_WRITE_BUFFERS=y
+-- 
+2.25.1
+
