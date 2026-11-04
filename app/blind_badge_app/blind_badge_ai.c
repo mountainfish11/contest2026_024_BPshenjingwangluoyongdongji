@@ -185,15 +185,13 @@ static int fallback_with_reason(const char *reason,
                                 char *response, size_t response_size,
                                 int *used_fallback)
 {
-  printf("[BlindBadge] ai_error: %s\n", reason);
-  printf("[BlindBadge] fallback_reason: %s\n", reason);
+  (void)reason;
   blind_badge_fallback_response(local_suggestion, response, response_size);
   if (used_fallback != NULL)
     {
       *used_fallback = 1;
     }
 
-  printf("[BlindBadge] fallback_response: %s\n", response);
   return 0;
 }
 
@@ -307,8 +305,6 @@ static int ask_agent(const char *ai_prompt,
                                   used_fallback);
     }
 
-  printf("[BlindBadge] ai_status: waiting for ai_agent response...\n");
-
   add_timeout_ms(&ts, BLIND_BADGE_AGENT_TIMEOUT_MS);
   pthread_mutex_lock(&waiter.lock);
   while (!waiter.done)
@@ -370,7 +366,6 @@ static int ask_ai_direct(const char *ai_prompt,
   snprintf(messages_json, sizeof(messages_json),
            "[{\"role\":\"user\",\"content\":\"%s\"}]", escaped_prompt);
 
-  printf("[BlindBadge] ai_status: calling ai_agent llm router...\n");
   vela_tls_set_request_timeout(BLIND_BADGE_DIRECT_TIMEOUT_SEC);
   memset(raw_response, 0, sizeof(raw_response));
   ret = llm_chat(system_prompt, messages_json, raw_response,
@@ -382,7 +377,6 @@ static int ask_ai_direct(const char *ai_prompt,
        * connection.  A service cancellation suppresses this retry.
        */
 
-      printf("[BlindBadge] ai_status: reconnecting AI request...\n");
       vela_tls_pool_cleanup();
       memset(raw_response, 0, sizeof(raw_response));
       ret = llm_chat(system_prompt, messages_json, raw_response,

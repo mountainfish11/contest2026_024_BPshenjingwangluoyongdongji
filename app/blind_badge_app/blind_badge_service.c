@@ -270,7 +270,6 @@ static void *voice_service_worker(void *arg)
       strlcpy(recognized, g_voice_text, sizeof(recognized));
       g_voice_text_pending = false;
       strlcpy(g_voice_detail, "AI thinking", sizeof(g_voice_detail));
-      printf("[BlindBadge] voice_asr: %s\n", recognized);
 
       /* Never hold the service lock across DNS/TLS/LLM work.  stop() must
        * remain able to mark this generation cancelled and abort the active
@@ -307,8 +306,6 @@ static void *voice_service_worker(void *arg)
 
       if (ret == 0 && !used_fallback && response[0] != '\0')
         {
-          printf("[BlindBadge] voice_ai_result: text=%s\n", response);
-
           /* Release the lock while sending to keep link callbacks and a
            * simultaneous forced stop independent of this worker.
            */
@@ -324,7 +321,6 @@ static void *voice_service_worker(void *arg)
            * unambiguous during validation and normal use.
            */
 
-          printf("[BlindBadge] voice_ai_failed: fallback suppressed\n");
           pthread_mutex_unlock(&g_service_lock);
           ret = voice_resume_listening(generation);
           pthread_mutex_lock(&g_service_lock);
@@ -351,7 +347,6 @@ static void *voice_service_worker(void *arg)
             {
               strlcpy(g_voice_detail, "reply sent",
                       sizeof(g_voice_detail));
-              printf("[BlindBadge] voice_ai_response: %s\n", response);
             }
         }
       else
@@ -453,7 +448,6 @@ static int test_service_worker(int argc, char *argv[])
         {
           strlcpy(g_test_detail, "AI request OK", sizeof(g_test_detail));
           g_service_state = BLIND_BADGE_SERVICE_RUNNING;
-          printf("[BlindBadge] test_ai_response: %s\n", response);
         }
       else
         {
