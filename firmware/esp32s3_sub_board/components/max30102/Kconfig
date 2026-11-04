@@ -32,7 +32,11 @@ menu "MAX30102 Heart Rate and SpO2 Sensor Configuration"
 
     config MAX30102_FINGER_THRESHOLD
         int "IR finger-present threshold"
-        default 50000
+        default 80000
         range 1000 262143
+        help
+            Threshold after FIFO averaging.  The supported module measures
+            about 60000 counts with no finger and 136000 counts with a finger.
+            Detection uses hysteresis below this value to avoid chattering.
 
 endmenu

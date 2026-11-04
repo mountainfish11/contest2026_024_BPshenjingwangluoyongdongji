@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +62,8 @@ static const char *const s_menu_speech_labels[] = {
 #define MENU_AUDIO_RELEASE_MS 3000U
 #define MENU_AUDIO_RELEASE_POLL_MS 20U
 #define HEALTH_POLL_MS 250U
-#define HEALTH_VALID_POLLS 4U
+#define HEALTH_VALID_WINDOWS 3U
+#define HEALTH_MAX_BPM_DELTA 8.0f
 #define HEALTH_TASK_STACK_SIZE 4096U
 #define HEALTH_TASK_PRIORITY 5U
 #define HEALTH_SPEECH_WAIT_MS 15000U
@@ -180,7 +182,9 @@ static void health_monitor_task(void *arg)
 {
     uint16_t generation = (uint16_t)(uintptr_t)arg;
     max30102_data_t data = {0};
-    unsigned int valid_polls = 0;
+    uint32_t analysis_sequence = 0;
+    unsigned int valid_windows = 0;
+    float stable_bpm = 0.0f;
     int heart_rate_bpm = 0;
     char speech[64];
 
@@ -197,18 +201,35 @@ static void health_monitor_task(void *arg)
         goto done;
     }
 
+    if (MAX30102_GetData(&data) == ESP_OK) {
+        analysis_sequence = data.analysis_sequence;
+    }
+
     while (health_session_current(generation)) {
         if (MAX30102_GetData(&data) == ESP_OK && data.running &&
             data.sensor_present && data.finger_present &&
             data.heart_rate_valid && data.last_sample_age_ms < 1000U &&
-            data.heart_rate_bpm >= 30.0f && data.heart_rate_bpm <= 220.0f) {
-            valid_polls++;
-            if (valid_polls >= HEALTH_VALID_POLLS) {
-                heart_rate_bpm = (int)(data.heart_rate_bpm + 0.5f);
+            data.analysis_sequence != analysis_sequence &&
+            data.heart_rate_bpm >= 40.0f && data.heart_rate_bpm <= 180.0f) {
+            analysis_sequence = data.analysis_sequence;
+            if (valid_windows == 0 ||
+                fabsf(data.heart_rate_bpm - stable_bpm) <=
+                HEALTH_MAX_BPM_DELTA) {
+                stable_bpm = valid_windows == 0 ? data.heart_rate_bpm :
+                    (stable_bpm * valid_windows + data.heart_rate_bpm) /
+                    (valid_windows + 1U);
+                valid_windows++;
+            } else {
+                stable_bpm = data.heart_rate_bpm;
+                valid_windows = 1;
+            }
+            if (valid_windows >= HEALTH_VALID_WINDOWS) {
+                heart_rate_bpm = (int)(stable_bpm + 0.5f);
                 break;
             }
-        } else {
-            valid_polls = 0;
+        } else if (!data.finger_present || !data.heart_rate_valid) {
+            valid_windows = 0;
+            stable_bpm = 0.0f;
         }
         vTaskDelay(pdMS_TO_TICKS(HEALTH_POLL_MS));
     }
@@ -883,6 +904,7 @@ static void handle_console_command(char *line)
         ESP_LOGI(TAG,
                  "MAX30102: running=%s present=%s part=0x%02x rev=0x%02x "
                  "finger=%s RED=%lu IR=%lu samples=%lu age_ms=%lu "
+                 "analysis=%lu IR_mean=%.1f AC_rms=%.1f "
                  "FIFO_overflows=%lu I2C_errors=%lu",
                  sensor.running ? "yes" : "no",
                  sensor.sensor_present ? "yes" : "no", sensor.part_id,
@@ -892,6 +914,8 @@ static void handle_console_command(char *line)
                  (unsigned long)sensor.ir_raw,
                  (unsigned long)sensor.samples,
                  (unsigned long)sensor.last_sample_age_ms,
+                 (unsigned long)sensor.analysis_sequence,
+                 sensor.ir_mean, sensor.ir_ac_rms,
                  (unsigned long)sensor.fifo_overflows,
                  (unsigned long)sensor.i2c_errors);
         ESP_LOGI(TAG, "MAX30102 estimate: HR=%s %.1f BPM SpO2=%s %.1f%%",

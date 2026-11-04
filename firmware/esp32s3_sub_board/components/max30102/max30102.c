@@ -35,7 +35,17 @@
 #define MAX30102_SPO2_CONFIG_VALUE    0x2f
 #define MAX30102_INTR_ENABLE_VALUE    0xc0
 #define MAX30102_SAMPLE_RATE_HZ       100
-#define MAX30102_WINDOW_SAMPLES       400
+#define MAX30102_WINDOW_SAMPLES       600
+#define MAX30102_BASELINE_SAMPLES     100
+#define MAX30102_SMOOTH_SAMPLES       5
+#define MAX30102_MIN_PEAK_DISTANCE    35
+#define MAX30102_MAX_PEAK_DISTANCE    150
+#define MAX30102_MAX_PEAKS            20
+#define MAX30102_MIN_INTERVALS        3
+#define MAX30102_MIN_FILTERED_RMS     60.0f
+#define MAX30102_MIN_AC_DC_RATIO      0.0004f
+#define MAX30102_MAX_IR_MEAN          250000.0f
+#define MAX30102_FINGER_RELEASE_RATIO 0.85f
 #define MAX30102_TASK_STACK_SIZE      4096
 #define MAX30102_TASK_PRIORITY        6
 #define MAX30102_I2C_TIMEOUT_MS       100
@@ -50,9 +60,12 @@ static uint32_t s_red_window[MAX30102_WINDOW_SAMPLES];
 static uint32_t s_ir_window[MAX30102_WINDOW_SAMPLES];
 static uint32_t s_analysis_red[MAX30102_WINDOW_SAMPLES];
 static uint32_t s_analysis_ir[MAX30102_WINDOW_SAMPLES];
+static float s_ir_detrended[MAX30102_WINDOW_SAMPLES];
+static float s_ir_filtered[MAX30102_WINDOW_SAMPLES];
 static size_t s_window_used;
 static size_t s_window_head;
 static int64_t s_last_sample_us;
+static bool s_finger_latched;
 
 static esp_err_t max30102_read(uint8_t reg, uint8_t *data, size_t length)
 {
@@ -154,43 +167,113 @@ static int compare_u16(const void *left, const void *right)
     return (a > b) - (a < b);
 }
 
-static bool calculate_heart_rate(const uint32_t *ir, size_t count,
-                                 float mean, float rms, float *bpm)
+static float filter_ir_signal(const uint32_t *ir, size_t count)
 {
-    uint16_t intervals[16];
-    size_t interval_count = 0;
-    size_t previous_peak = 0;
-    bool have_peak = false;
-    float threshold = mean + rms * 0.35f;
+    double baseline_sum = 0.0;
+    double smooth_sum = 0.0;
+    double energy = 0.0;
+    size_t energy_count = 0;
 
-    for (size_t i = 2; i + 2 < count; i++) {
-        bool local_peak = ir[i] > threshold && ir[i] >= ir[i - 1] &&
-                          ir[i] > ir[i + 1] && ir[i] >= ir[i - 2] &&
-                          ir[i] > ir[i + 2];
+    for (size_t i = 0; i < count; i++) {
+        baseline_sum += ir[i];
+        if (i >= MAX30102_BASELINE_SAMPLES) {
+            baseline_sum -= ir[i - MAX30102_BASELINE_SAMPLES];
+        }
+
+        size_t baseline_count = i + 1;
+        if (baseline_count > MAX30102_BASELINE_SAMPLES) {
+            baseline_count = MAX30102_BASELINE_SAMPLES;
+        }
+        s_ir_detrended[i] =
+            (float)((double)ir[i] - baseline_sum / baseline_count);
+
+        smooth_sum += s_ir_detrended[i];
+        if (i >= MAX30102_SMOOTH_SAMPLES) {
+            smooth_sum -= s_ir_detrended[i - MAX30102_SMOOTH_SAMPLES];
+        }
+        size_t smooth_count = i + 1;
+        if (smooth_count > MAX30102_SMOOTH_SAMPLES) {
+            smooth_count = MAX30102_SMOOTH_SAMPLES;
+        }
+        s_ir_filtered[i] = (float)(smooth_sum / smooth_count);
+
+        if (i >= MAX30102_BASELINE_SAMPLES) {
+            energy += (double)s_ir_filtered[i] * s_ir_filtered[i];
+            energy_count++;
+        }
+    }
+
+    return energy_count > 0 ? (float)sqrt(energy / energy_count) : 0.0f;
+}
+
+static bool calculate_heart_rate(size_t count, float rms, float *bpm)
+{
+    uint16_t peaks[MAX30102_MAX_PEAKS];
+    float peak_values[MAX30102_MAX_PEAKS];
+    uint16_t intervals[MAX30102_MAX_PEAKS - 1];
+    uint16_t accepted[MAX30102_MAX_PEAKS - 1];
+    size_t peak_count = 0;
+    size_t interval_count = 0;
+    size_t accepted_count = 0;
+    float threshold = rms * 0.30f;
+
+    for (size_t i = MAX30102_BASELINE_SAMPLES + 2; i + 2 < count; i++) {
+        bool local_peak = s_ir_filtered[i] > threshold &&
+                          s_ir_filtered[i] >= s_ir_filtered[i - 1] &&
+                          s_ir_filtered[i] > s_ir_filtered[i + 1] &&
+                          s_ir_filtered[i] >= s_ir_filtered[i - 2] &&
+                          s_ir_filtered[i] > s_ir_filtered[i + 2];
         if (!local_peak) {
             continue;
         }
-        if (have_peak) {
-            size_t interval = i - previous_peak;
-            if (interval >= 30 && interval <= 150) {
-                if (interval_count < sizeof(intervals) / sizeof(intervals[0])) {
-                    intervals[interval_count++] = (uint16_t)interval;
-                }
-            } else if (interval < 30) {
-                continue;
+
+        if (peak_count > 0 && i - peaks[peak_count - 1] <
+                              MAX30102_MIN_PEAK_DISTANCE) {
+            if (s_ir_filtered[i] > peak_values[peak_count - 1]) {
+                peaks[peak_count - 1] = (uint16_t)i;
+                peak_values[peak_count - 1] = s_ir_filtered[i];
             }
+            continue;
         }
-        previous_peak = i;
-        have_peak = true;
+        if (peak_count < MAX30102_MAX_PEAKS) {
+            peaks[peak_count] = (uint16_t)i;
+            peak_values[peak_count] = s_ir_filtered[i];
+            peak_count++;
+        }
     }
 
-    if (interval_count < 2) {
+    for (size_t i = 1; i < peak_count; i++) {
+        uint16_t interval = peaks[i] - peaks[i - 1];
+        if (interval >= MAX30102_MIN_PEAK_DISTANCE &&
+            interval <= MAX30102_MAX_PEAK_DISTANCE) {
+            intervals[interval_count++] = interval;
+        }
+    }
+    if (interval_count < MAX30102_MIN_INTERVALS) {
         return false;
     }
+
     qsort(intervals, interval_count, sizeof(intervals[0]), compare_u16);
     float median = intervals[interval_count / 2];
-    *bpm = 60.0f * MAX30102_SAMPLE_RATE_HZ / median;
-    return *bpm >= 40.0f && *bpm <= 200.0f;
+    float tolerance = fmaxf(6.0f, median * 0.18f);
+    for (size_t i = 0; i < interval_count; i++) {
+        if (fabsf((float)intervals[i] - median) <= tolerance) {
+            accepted[accepted_count++] = intervals[i];
+        }
+    }
+    if (accepted_count < MAX30102_MIN_INTERVALS) {
+        return false;
+    }
+
+    qsort(accepted, accepted_count, sizeof(accepted[0]), compare_u16);
+    float stable_interval = accepted[accepted_count / 2];
+    float spread = accepted[accepted_count - 1] - accepted[0];
+    if (spread > stable_interval * 0.22f) {
+        return false;
+    }
+
+    *bpm = 60.0f * MAX30102_SAMPLE_RATE_HZ / stable_interval;
+    return isfinite(*bpm) && *bpm >= 40.0f && *bpm <= 180.0f;
 }
 
 static void analyze_window(void)
@@ -209,13 +292,25 @@ static void analyze_window(void)
                                   red_mean);
     float ir_rms = calculate_rms(s_analysis_ir, MAX30102_WINDOW_SAMPLES,
                                  ir_mean);
-    bool finger = ir_mean >= CONFIG_MAX30102_FINGER_THRESHOLD;
+    float filtered_rms = filter_ir_signal(s_analysis_ir,
+                                          MAX30102_WINDOW_SAMPLES);
+    float release_threshold = CONFIG_MAX30102_FINGER_THRESHOLD *
+                              MAX30102_FINGER_RELEASE_RATIO;
+    if (s_finger_latched) {
+        s_finger_latched = ir_mean >= release_threshold;
+    } else {
+        s_finger_latched = ir_mean >= CONFIG_MAX30102_FINGER_THRESHOLD;
+    }
+    bool finger = s_finger_latched && ir_mean < MAX30102_MAX_IR_MEAN;
+    bool signal_quality = finger && filtered_rms >=
+                          MAX30102_MIN_FILTERED_RMS &&
+                          filtered_rms / ir_mean >=
+                          MAX30102_MIN_AC_DC_RATIO;
     float bpm = 0.0f;
-    bool hr_valid = finger && ir_rms > 100.0f &&
-                    calculate_heart_rate(s_analysis_ir,
-                                         MAX30102_WINDOW_SAMPLES,
-                                         ir_mean, ir_rms, &bpm);
-    bool spo2_valid = finger && red_mean > 1.0f && ir_mean > 1.0f &&
+    bool hr_valid = signal_quality &&
+                    calculate_heart_rate(MAX30102_WINDOW_SAMPLES,
+                                         filtered_rms, &bpm);
+    bool spo2_valid = hr_valid && red_mean > 1.0f && ir_mean > 1.0f &&
                       red_rms > 10.0f && ir_rms > 10.0f;
     float spo2 = 0.0f;
     if (spo2_valid) {
@@ -233,6 +328,9 @@ static void analyze_window(void)
         s_data.spo2_valid = spo2_valid;
         s_data.heart_rate_bpm = hr_valid ? bpm : 0.0f;
         s_data.spo2_percent = spo2_valid ? spo2 : 0.0f;
+        s_data.ir_mean = ir_mean;
+        s_data.ir_ac_rms = filtered_rms;
+        s_data.analysis_sequence++;
         xSemaphoreGive(s_lock);
     }
 }

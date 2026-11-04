@@ -21,11 +21,14 @@ typedef struct
     uint32_t red_raw;
     uint32_t ir_raw;
     uint32_t samples;
+    uint32_t analysis_sequence;
     uint32_t fifo_overflows;
     uint32_t i2c_errors;
     uint32_t last_sample_age_ms;
     float heart_rate_bpm;
     float spo2_percent;
+    float ir_mean;
+    float ir_ac_rms;
 } max30102_data_t;
 
 esp_err_t MAX30102_Init(void);
