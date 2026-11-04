@@ -1,0 +1,25 @@
+menu "M100M 4G Transparent UART Configuration"
+
+    config M100M_UART_NUM
+        int "UART controller"
+        range 1 2
+        default 2
+
+    config M100M_UART_BAUD_RATE
+        int "UART baud rate"
+        range 1200 460800
+        default 115200
+        help
+            This must match the serial configuration in the Yinerda mini app.
+
+    config M100M_UART_RX_GPIO
+        int "Module TXD to controller RX GPIO"
+        range 0 48
+        default 15
+
+    config M100M_UART_TX_GPIO
+        int "Module RXD from controller TX GPIO"
+        range 0 48
+        default 16
+
+endmenu

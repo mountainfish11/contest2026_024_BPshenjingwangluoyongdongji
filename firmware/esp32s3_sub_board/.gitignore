@@ -1,0 +1,13 @@
+build/
+build_*/
+sdkconfig.old
+*.pyc
+__pycache__/
+managed_components/
+# Keep dependencies.lock in the contest repository for reproducible builds.
+!dependencies.lock
+sdkconfig
+out/
+.clangd
+.vscode/
+*.code-workspace

@@ -1,119 +1,38 @@
-# Final Submission Materials
+# 决赛提交索引
 
-Use this page as the submission index for BlindBadge.
+## 代码与复现
 
-## Required Reading Order
+1. `README.md`：当前产品能力、目录和构建入口。
+2. `docs/clean_reproduction_check.md`：干净工作区复现与验收门槛。
+3. `docs/openvela_workspace_dependencies.md`：公共仓基线和补丁。
+4. `patches/openvela/`：可审计的公共仓提交序列。
+5. `firmware/esp32s3_sub_board/`：副板完整源码快照。
+6. `vision/`：Windows GPU 视觉服务。
+7. `protocol/blind_badge_protocol.md`：主副板消息协议。
+8. `logs/`：官方格式 AI Coding 日志。
 
-1. `README.md`
+## 评委演示重点
 
-   Product overview, build command, QEMU run command, basic demos, Skill verification entry point.
+- 主板 openvela 菜单负责服务生命周期，PLAY 双击强制退出当前任务。
+- VISION：相机流、Windows CUDA 推理、语音提醒和非阻塞振动。
+- VOICE：FY-SP701、VAD、流式火山 ASR、主板 MiMo、多轮播报。
+- HEALTH：MAX30102 原型心率/血氧检测与播报。
+- ALERT：M100M 4G 报警、邮件确认和三次振动。
+- 服务之间有清晰边界，退出后释放任务资源，初始化资源除外。
 
-2. `docs/acceptance_checklist.md`
+## 安全边界
 
-   Fixed end-to-end验收流程：clean QEMU, Skill install, Skill loader verification, fallback, MiMo, `demo --ai`, emergency action.
+BlindBadge 是辅助提醒原型，不替代盲杖、导盲犬或医疗设备。心率/血氧结果仅
+用于功能演示，不用于诊断。AI 失败时不能阻塞紧急报警等确定性安全动作。
 
-3. `docs/technical_architecture.md`
+## 决赛平台材料
 
-   Architecture and data flow:
+平台填写与代码 PR 是两件事。平台材料包括：
 
-   ```text
-   simulated/sensor event -> event -> policy -> ai -> fallback -> action
-   ```
+- 答辩 PPT（必传，使用官方群公告模板）；
+- 已合入的大赛专属 GitHub 仓库地址（必填）；
+- 演示视频（建议）；
+- 实物照片（建议）；
+- 初赛后主要更新（选填）。
 
-4. `docs/demo_script_3min.md`
-
-   3-minute video or live-demo script.
-
-5. `docs/blind_badge_skill.md`
-
-   Custom Skill role, runtime install method, `/skill` verification, standalone `ai_agent` behavior.
-
-6. `tests/qemu_manual_test.md`
-
-   Historical and latest QEMU verification logs.
-
-7. `docs/clean_reproduction_check.md`
-
-   Manifest, defconfig, runtime path, secret handling, and clean data checks.
-
-8. `docs/product_design.md`
-
-   User scenario and product MVP.
-
-9. `docs/hardware_plan_esp32_s3_eye.md`
-
-   ESP32-S3-EYE hardware positioning, board resource mapping, safety boundary, and staged hardware plan.
-
-10. `protocol/blind_badge_protocol.md`
-
-   Event protocol direction for later sensor integration.
-
-## Key Demo Commands
-
-```bash
-blind_badge_app help
-blind_badge_app install_skill
-echo ask /skill | ai_agent
-blind_badge_app obstacle 80 front
-blind_badge_app obstacle 40 front --ai
-blind_badge_app step_down front --ai
-blind_badge_app emergency --ai
-ai_agent
-router_set mimo <MIMO_TOKEN_PLAN_KEY>
-ask BlindBadge event=obstacle_near distance_cm=40 direction=front
-quit
-blind_badge_app demo --ai
-```
-
-## What Judges Should See
-
-- A clear assistive hardware scenario for blind and low-vision users.
-- A clear safety boundary: this is a safety-reminder prototype, not a mature blind navigation replacement.
-- A custom `ai_agent` Skill that is actually installed into the runtime loader path.
-- Safety reminders constrained to one short Chinese sentence.
-- Local deterministic fallback when MiMo is unavailable.
-- Emergency help behavior that does not depend on AI.
-- Simulated voice, vibration, and emergency-send execution actions.
-- A proactive demo that presents the product loop, not just isolated commands.
-
-## Risk And Fallback Summary
-
-Risk:
-
-- network unavailable;
-- MiMo key missing;
-- MiMo timeout or empty response;
-- AI response too long;
-- emergency event arrives during AI failure.
-
-Fallback:
-
-- local policy produces the final reminder;
-- `fallback_reason` is printed;
-- `ai_response` is filled with local safe wording;
-- action simulation still runs;
-- emergency always has a local help message and `action.emergency_send: triggered`.
-
-## Later Hardware Integration
-
-Replace only the event source first:
-
-```text
-ultrasonic/camera/cane input -> struct blind_badge_event
-```
-
-Keep the existing modules:
-
-- policy thresholds;
-- AI prompt generation;
-- fallback;
-- Skill rules;
-- action execution mapping.
-
-Then connect actions:
-
-- `action.voice` -> TTS playback;
-- `action.vibration` -> vibration motor;
-- `action.emergency_send` -> phone companion, SMS, Feishu, or MQTT gateway.
-
-ESP32-S3-EYE v1 should prioritize button-triggered emergency, camera/preset obstacle events, LCD/serial debug output, Wi-Fi MiMo access, and an external vibration motor or buzzer.
+评审代码以截止时已经合入专属仓库的内容为准，fork 和未合并分支不计入。

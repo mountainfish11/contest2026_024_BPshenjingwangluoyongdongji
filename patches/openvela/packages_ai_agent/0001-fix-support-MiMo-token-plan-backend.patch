@@ -1,0 +1,97 @@
+From ad6a47520e9abd8a2b6a58676b527dc24013ca9c Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Wed, 2 Sep 2026 19:37:21 +0800
+Subject: [PATCH 1/6] fix: support MiMo token plan backend
+
+---
+ include/agent_config.h |  4 ++--
+ src/channels/cmd_llm.c |  4 ++--
+ src/llm/llm_proxy.c    | 20 ++++++++++++++++++++
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/include/agent_config.h b/include/agent_config.h
+index 32b28aa..cea15b7 100644
+--- a/include/agent_config.h
++++ b/include/agent_config.h
+@@ -154,9 +154,9 @@
+ #define AGENT_LLM_OPENROUTER_MODEL "qwen/qwen3-coder:free"
+ 
+ /* ── MiMo (Xiaomi MiMo platform) ───────────────────────────── */
+-#define AGENT_LLM_MIMO_HOST "api.xiaomimimo.com"
++#define AGENT_LLM_MIMO_HOST "token-plan-cn.xiaomimimo.com"
+ #define AGENT_LLM_MIMO_PATH "/v1/chat/completions"
+-#define AGENT_LLM_MIMO_MODEL "mimo-v2-flash"
++#define AGENT_LLM_MIMO_MODEL "mimo-v2.5"
+ 
+ /* ── Message Bus ────────────────────────────────────────────── */
+ #define AGENT_BUS_QUEUE_LEN 16
+diff --git a/src/channels/cmd_llm.c b/src/channels/cmd_llm.c
+index a77cbf7..efa211c 100644
+--- a/src/channels/cmd_llm.c
++++ b/src/channels/cmd_llm.c
+@@ -47,7 +47,7 @@ static const router_preset_t g_router_presets[] = {
+     { "glm", "open.bigmodel.cn", "/api/paas/v4/chat/completions", "glm-4-flash", 1 },
+     { "openai", "api.openai.com", "/v1/chat/completions", "gpt-4o", 3 },
+     { "claude", "api.anthropic.com", "/v1/messages", "claude-sonnet-4-20250514", 3 },
+-    { "mimo", "api.xiaomimimo.com", "/v1/chat/completions", "MiMo-v2-Flash", 1 },
++    { "mimo", "token-plan-cn.xiaomimimo.com", "/v1/chat/completions", "mimo-v2.5", 1 },
+     { "openrouter", "openrouter.ai", "/api/v1/chat/completions",
+         "openrouter/hunter-alpha", 2 },
+     { NULL, NULL, NULL, NULL, 0 }
+@@ -69,7 +69,7 @@ void cmd_set_llm(int argc, char** argv)
+                "  glm      - open.bigmodel.cn  (glm-4-flash)\n"
+                "  openai   - api.openai.com  (gpt-4o)\n"
+                "  openrouter - openrouter.ai  (openrouter/hunter-alpha)\n"
+-               "  mimo     - api.xiaomimimo.com  (MiMo-v2-Flash)\n"
++               "  mimo     - token-plan-cn.xiaomimimo.com  (mimo-v2.5)\n"
+                "\n"
+                "URL format (for custom endpoints):\n"
+                "  set_llm http://host:port/path model key\n"
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index c682d90..b775608 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -57,6 +57,22 @@ bool is_openai_compat_host(const char* host)
+ }
+ 
+ 
++static void add_mimo_thinking_disabled(cJSON* body, const char* host)
++{
++    if (!body || !host || !strstr(host, "xiaomimimo.com")) {
++        return;
++    }
++
++    cJSON* thinking = cJSON_CreateObject();
++    if (!thinking) {
++        return;
++    }
++
++    cJSON_AddStringToObject(thinking, "type", "disabled");
++    cJSON_AddItemToObject(body, "thinking", thinking);
++}
++
++
+ int resp_buf_init(resp_buf_t* rb, size_t initial_cap)
+ {
+     rb->data = calloc(1, initial_cap);
+@@ -509,6 +525,8 @@ int llm_chat(const char* system_prompt, const char* messages_json,
+     else
+         cJSON_AddNumberToObject(body, "max_tokens", AGENT_LLM_MAX_TOKENS);
+ 
++    add_mimo_thinking_disabled(body, llm_host);
++
+     cJSON* messages = cJSON_Parse(messages_json);
+     if (!messages)
+         messages = cJSON_CreateArray();
+@@ -627,6 +645,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
+             AGENT_LLM_MAX_TOKENS);
+     }
+ 
++    add_mimo_thinking_disabled(body, llm_host);
++
+     /* Clone messages and prepend system message */
+     cJSON* msgs = cJSON_Duplicate(messages, 1);
+     cJSON* sys_msg = cJSON_CreateObject();
+-- 
+2.25.1
+

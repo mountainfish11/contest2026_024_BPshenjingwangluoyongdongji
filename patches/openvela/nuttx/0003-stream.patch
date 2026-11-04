@@ -1,0 +1,54 @@
+From 96b2b632d80953c52831531f3140e9c972232a94 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Sun, 25 Oct 2026 10:55:33 +0800
+Subject: [PATCH 3/9] =?UTF-8?q?stream=E5=B7=B2=E9=80=9A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ arch/xtensa/src/esp32s3/esp32s3_wlan.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wlan.c b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+index a78783b27df..287e1cae8f8 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wlan.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+@@ -29,6 +29,7 @@
+ #include <assert.h>
+ #include <errno.h>
+ #include <stdio.h>
++#include <unistd.h>
+ #include <debug.h>
+ #include <arpa/inet.h>
+ 
+@@ -61,6 +62,7 @@
+ /* TX timeout = 1 minute */
+ 
+ #define WLAN_TXTOUT               (60 * CLK_TCK)
++#define WLAN_TX_PACE_US           2000
+ 
+ /* Low-priority work queue processes RX/TX */
+ 
+@@ -559,14 +561,14 @@ static void wlan_transmit(struct wlan_priv_s *priv)
+ 
+           wlan_free_buffer(priv, pktbuf->buffer);
+ 
+-          /* The Wi-Fi driver reports completion asynchronously.  Submit
+-           * one frame at a time and let wlan_tx_done() schedule the next
+-           * one instead of filling the vendor TX queue in a tight loop.
++          /* Avoid filling the vendor TX queue in a tight loop.  A short
++           * yield preserves forward progress even if a completion callback
++           * is delayed or coalesced.
+            */
+ 
+           if (ret >= 0)
+             {
+-              break;
++              usleep(WLAN_TX_PACE_US);
+             }
+         }
+     }
+-- 
+2.25.1
+

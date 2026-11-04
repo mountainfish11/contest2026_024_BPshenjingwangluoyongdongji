@@ -1,0 +1,304 @@
+From b1e054f713f77520c6faac1f8bef229fc7847057 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Sun, 1 Nov 2026 07:09:38 +0800
+Subject: [PATCH 8/9] fix: keep camera startup from blocking BlindBadge UI
+
+---
+ arch/xtensa/src/esp32s3/esp32s3_cam.c         | 27 -------------------
+ .../esp32s3-eye/src/esp32s3_board_camera.c    | 17 ------------
+ .../esp32s3/esp32s3-eye/src/esp32s3_bringup.c | 19 ++++++-------
+ drivers/video/ov2640.c                        |  4 ---
+ drivers/video/v4l2_cap.c                      |  1 -
+ 5 files changed, 10 insertions(+), 58 deletions(-)
+
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index 8d215b96c5b..ecfbe49405f 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -728,10 +728,8 @@ static void esp32s3_cam_enableclk(void)
+ 
+ static int esp32s3_cam_dmasetup(struct esp32s3_cam_s *priv)
+ {
+-  printf("CAM: GDMA request begin\n");
+   priv->dma_channel = esp32s3_dma_request(ESP32S3_DMA_PERIPH_LCDCAM,
+                                           1, 10, true);
+-  printf("CAM: GDMA request ret=%ld\n", (long)priv->dma_channel);
+   if (priv->dma_channel < 0)
+     {
+       snerr("ERROR: Failed to allocate GDMA channel\n");
+@@ -759,8 +757,6 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+   uint32_t regval;
+   irqstate_t flags;
+ 
+-  printf("CAM: controller config begin\n");
+-
+   /* Reset CAM module and AFIFO first */
+ 
+   regval = LCD_CAM_CAM_RESET_M | LCD_CAM_CAM_AFIFO_RESET_M;
+@@ -799,8 +795,6 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+                    DMA_INDSCR_BURST_EN_CH0_M |
+                    DMA_IN_DATA_BURST_EN_CH0_M);
+ 
+-  printf("CAM: GDMA configured\n");
+-
+   /* Disable all LCD_CAM interrupts and clear pending */
+ 
+   putreg32(0, LCD_CAM_LC_DMA_INT_ENA_REG);
+@@ -815,7 +809,6 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+    * won't be serviced until after irq_attach completes.
+    */
+ 
+-  printf("CAM: IRQ setup begin\n");
+   flags = spin_lock_irqsave(&priv->lock);
+ 
+   priv->cpu = this_cpu();
+@@ -840,17 +833,12 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+ 
+   spin_unlock_irqrestore(&priv->lock, flags);
+ 
+-  printf("CAM: IRQ setup done cpuint=%d attach=%d\n",
+-         priv->cpuint, ret);
+-
+   up_enable_irq(ESP32S3_IRQ_LCD_CAM);
+ 
+   regval = getreg32(LCD_CAM_LC_DMA_INT_ENA_REG);
+   regval |= LCD_CAM_CAM_VSYNC_INT_ENA_M;
+   putreg32(regval, LCD_CAM_LC_DMA_INT_ENA_REG);
+ 
+-  printf("CAM: controller config done\n");
+-
+   return OK;
+ }
+ 
+@@ -884,17 +872,13 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+       priv->slots[i].state = ESP32S3_CAM_SLOT_FREE;
+     }
+ 
+-  printf("CAM: IMGDATA init begin\n");
+-
+   /* Configure GPIO pins */
+ 
+   esp32s3_cam_gpio_config();
+-  printf("CAM: GPIO configured\n");
+ 
+   /* Enable clock and configure XCLK */
+ 
+   esp32s3_cam_enableclk();
+-  printf("CAM: peripheral clock configured\n");
+ 
+   /* Configure CAM controller */
+ 
+@@ -911,9 +895,6 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
+   unsigned int i;
+   uint32_t regval;
+ 
+-  printf("CAM: IMGDATA uninit begin cpuint=%d dma=%ld\n",
+-         priv->cpuint, (long)priv->dma_channel);
+-
+   priv->streaming = false;
+   for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
+     {
+@@ -953,8 +934,6 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
+ 
+   priv->capturing = false;
+ 
+-  printf("CAM: IMGDATA uninit done\n");
+-
+   return OK;
+ }
+ 
+@@ -1024,8 +1003,6 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
+             }
+ 
+           memset(priv->slots[i].fb, 0, alloc_size);
+-          printf("CAM: slot %u buffer=%p bytes=%" PRIu32 "\n",
+-                 i, priv->slots[i].fb, alloc_size);
+           priv->slots[i].state = ESP32S3_CAM_SLOT_FREE;
+         }
+ 
+@@ -1126,7 +1103,6 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+   irqstate_t flags;
+   unsigned int i;
+-  bool dma_parked = false;
+   uint32_t regval;
+ 
+   flags = spin_lock_irqsave(&priv->lock);
+@@ -1153,7 +1129,6 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+ 
+           if ((getreg32(regaddr) & DMA_INLINK_PARK_CH0) != 0)
+             {
+-              dma_parked = true;
+               break;
+             }
+         }
+@@ -1181,8 +1156,6 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+   priv->cb = NULL;
+   priv->cb_arg = NULL;
+ 
+-  printf("CAM: stop complete dma_parked=%d\n", dma_parked);
+-
+   return OK;
+ }
+ 
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index 6c58f202661..837ff038356 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -408,12 +408,10 @@ static int ov2640_start_xclk(void)
+     pwm = esp32s3_ledc_init(0);
+     if (pwm == NULL) {
+         syslog(LOG_ERR, "CAM: LEDC init failed\n");
+-        printf("CAM: LEDC init failed\n");
+         return -ENODEV;
+     }
+ 
+     ret = pwm->ops->setup(pwm);
+-    printf("CAM: XCLK setup ret=%d\n", ret);
+     if (ret < 0)
+       {
+         return ret;
+@@ -423,16 +421,12 @@ static int ov2640_start_xclk(void)
+     info.duty = (ub16_t)(65536 / 2);
+ 
+     ret = pwm->ops->start(pwm, &info);
+-    printf("CAM: XCLK start ret=%d frequency=%lu pin=%d\n",
+-           ret, (unsigned long)info.frequency,
+-           CONFIG_ESP32S3_LEDC_CHANNEL0_PIN);
+     if (ret < 0)
+       {
+         return ret;
+       }
+ 
+     g_ov2640_xclk_started = true;
+-    syslog(LOG_INFO, "CAM: LEDC XCLK 20MHz started on GPIO15\n");
+     return OK;
+ }
+ 
+@@ -443,11 +437,9 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+     int ret;
+ 
+     if (g_ov2640_initialized) {
+-        printf("CAM: OV2640 already initialized\n");
+         return OK;
+     }
+ 
+-    printf("CAM: OV2640 init begin\n");
+     ret = ov2640_start_xclk();
+     if (ret < 0)
+       {
+@@ -455,11 +447,9 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+         return ret;
+       }
+ 
+-    syslog(LOG_INFO, "CAM: LEDC XCLK started on GPIO15\n");
+     up_mdelay(50);
+ 
+     i2c = esp32s3_i2cbus_initialize(OV2640_I2C_BUS);
+-    printf("CAM: I2C%d initialize -> %p\n", OV2640_I2C_BUS, i2c);
+     if (i2c == NULL) {
+         syslog(LOG_ERR, "CAM: I2C%d initialization failed\n",
+             OV2640_I2C_BUS);
+@@ -472,7 +462,6 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+      */
+ 
+     ret = I2C_RESET(i2c);
+-    printf("CAM: I2C%d reset ret=%d\n", OV2640_I2C_BUS, ret);
+     if (ret < 0)
+       {
+         syslog(LOG_ERR, "CAM: I2C%d reset failed: %d\n",
+@@ -486,8 +475,6 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+     for (attempt = 1; attempt <= OV2640_INIT_ATTEMPTS; attempt++)
+       {
+         ret = ov2640_initialize(i2c);
+-        printf("CAM: ov2640_initialize attempt=%d ret=%d\n",
+-               attempt, ret);
+         if (ret >= 0)
+           {
+             break;
+@@ -497,7 +484,6 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+           {
+             int reset_ret = I2C_RESET(i2c);
+ 
+-            printf("CAM: OV2640 retry I2C reset ret=%d\n", reset_ret);
+             if (reset_ret < 0)
+               {
+                 ret = reset_ret;
+@@ -531,10 +517,7 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+         return ret;
+       }
+ 
+-    printf("CAM: CLKRC override=0x%02x\n", OV2640_CLKRC_BALANCED);
+-
+     g_ov2640_initialized = true;
+-    syslog(LOG_INFO, "OV2640 sensor configured for VGA JPEG\n");
+     return OK;
+ #else
+ 
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_bringup.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_bringup.c
+index 2c897862dbc..25a3ff12e7f 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_bringup.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_bringup.c
+@@ -315,15 +315,6 @@ int esp32s3_bringup(void)
+     }
+ #endif
+ 
+-#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_024_BLIND_BADGE_APP
+-  /* Start DN handling as soon as its ADC, WLAN, display and SD dependencies
+-   * are ready.  Camera initialization below can take several seconds; if the
+-   * task is started after it, an early post-reset DN click is lost.
+-   */
+-
+-  esp32s3_start_blindbadge_button();
+-#endif
+-
+ #ifdef CONFIG_ESP32S3_CAM
+   ret = board_camera_initialize();
+   if (ret < 0)
+@@ -332,6 +323,16 @@ int esp32s3_bringup(void)
+     }
+ #endif
+ 
++#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_024_BLIND_BADGE_APP
++  /* Keep board bring-up independent from the camera sensor.  BlindBadge
++   * initializes the sensor asynchronously after PLAY enters VISION, so an
++   * absent or slow sensor can never prevent the menu and buttons from
++   * becoming available.
++   */
++
++  esp32s3_start_blindbadge_button();
++#endif
++
+   /* If we got here then perhaps not all initialization was successful, but
+    * at least enough succeeded to bring-up NSH with perhaps reduced
+    * capabilities.
+diff --git a/drivers/video/ov2640.c b/drivers/video/ov2640.c
+index 646b0d4152e..12dc977a8cd 100644
+--- a/drivers/video/ov2640.c
++++ b/drivers/video/ov2640.c
+@@ -1443,10 +1443,6 @@ static int ovr2640_chipid(FAR struct i2c_master_s *i2c)
+   pidh = ov2640_getreg(i2c, 0x0a);      /* Product ID (MS) */
+   pidl = ov2640_getreg(i2c, 0x0b);      /* Product ID (LS) */
+ 
+-  printf("CAM: OV2640 PID registers 0x0a=0x%02x 0x0b=0x%02x "
+-         "expected 0x%02x 0x%02x\n",
+-         pidh, pidl, OVR2640_PRODUCT_IDH, OVR2640_PRODUCT_IDL);
+-
+ #ifdef CONFIG_DEBUG_GRAPHICS
+   midh = ov2640_getreg(i2c, 0x1c); /* Manufacturer ID (high) = 0x7f */
+   midl = ov2640_getreg(i2c, 0x1d); /* Manufacturer ID (low) = 0xa2 */
+diff --git a/drivers/video/v4l2_cap.c b/drivers/video/v4l2_cap.c
+index 97988d2e340..5b1591cef14 100644
+--- a/drivers/video/v4l2_cap.c
++++ b/drivers/video/v4l2_cap.c
+@@ -3619,7 +3619,6 @@ static int capture_open(FAR struct file *filep)
+       /* Only in first execution, open device */
+ 
+       ret = IMGSENSOR_INIT(cmng->imgsensor);
+-      printf("CAM: IMGSENSOR_INIT ret=%d\n", ret);
+       if (ret == OK)
+         {
+           ret = IMGDATA_INIT(cmng->imgdata);
+-- 
+2.25.1
+

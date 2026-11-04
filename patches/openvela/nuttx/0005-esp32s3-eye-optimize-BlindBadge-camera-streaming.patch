@@ -1,0 +1,880 @@
+From 6439acf7cbc806d3fd26b85334803268838a9d09 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Mon, 26 Oct 2026 17:22:04 +0800
+Subject: [PATCH 5/9] esp32s3-eye: optimize BlindBadge camera streaming
+
+---
+ arch/xtensa/src/esp32s3/esp32s3_cam.c         | 578 ++++++++++++++----
+ .../esp32s3-eye/configs/blindbadge/defconfig  |   3 +-
+ .../esp32s3-eye/src/esp32s3_board_camera.c    |   9 +
+ 3 files changed, 477 insertions(+), 113 deletions(-)
+
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index 5635e371114..298e6aa2080 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -76,6 +76,10 @@
+ #define ESP32S3_CAM_DMA_BUFLEN    3840
+ #define ESP32S3_CAM_DMADESC_NUM   96
+ #define ESP32S3_CAM_HALF_BUF_SIZE 15360
++#define ESP32S3_CAM_FRAME_SLOTS   2
++#define ESP32S3_CAM_WORK_QUEUE    HPWORK
++#define ESP32S3_CAM_STATS_FRAMES  30
++#define ESP32S3_CAM_CONTINUOUS_DMA 1
+ 
+ /* VSYNC filter threshold */
+ 
+@@ -85,31 +89,56 @@
+  * Private Types
+  ****************************************************************************/
+ 
++struct esp32s3_cam_s;
++
++enum esp32s3_cam_slot_state_e
++{
++  ESP32S3_CAM_SLOT_FREE = 0,
++  ESP32S3_CAM_SLOT_CAPTURING,
++  ESP32S3_CAM_SLOT_PENDING
++};
++
++struct esp32s3_cam_slot_s
++{
++  struct esp32s3_cam_s *priv;
++  struct esp32s3_dmadesc_s *dmadesc;
++  uint8_t *fb;
++  uint8_t index;
++  volatile enum esp32s3_cam_slot_state_e state;
++  struct work_s work;
++  struct timeval arm_ts;
++  struct timeval first_vsync_ts;
++  struct timeval frame_ts;
++};
++
+ struct esp32s3_cam_s
+ {
+   struct imgdata_s data;
+ 
++  bool streaming;
+   bool capturing;
+ 
+   int cpuint;
+   uint8_t cpu;
+   int32_t dma_channel;
+ 
+-  struct esp32s3_dmadesc_s dmadesc[ESP32S3_CAM_DMADESC_NUM];
+-
+-  uint8_t *fb;                    /* DMA frame buffer (with overflow) */
++  struct esp32s3_cam_slot_s slots[ESP32S3_CAM_FRAME_SLOTS];
+   uint8_t *v4l2_buf;              /* V4L2 userptr buffer (no overflow) */
+   uint32_t fb_size;               /* Frame size in bytes */
+   uint32_t fb_alloc;              /* DMA buffer allocated size */
+-  uint32_t fb_pos;                /* Current write position */
++  uint8_t active_slot;
+   uint8_t vsync_cnt;              /* VSYNC counter for frame sync */
+-  uint32_t dma_received;          /* Bytes received by DMA so far */
+-  int dma_desc_offset;            /* Next DMA descriptor index to load */
+ 
+   imgdata_capture_t cb;
+   void *cb_arg;
+-  struct work_s frame_work;
+-  struct timeval frame_ts;
++
++  uint32_t stat_frames;
++  uint32_t stat_restart_failures;
++  uint64_t stat_arm_first_us;
++  uint64_t stat_frame_us;
++  uint64_t stat_irq_work_us;
++  uint64_t stat_restart_us;
++  uint64_t stat_process_us;
+ 
+   int dma_cpuint;
+   uint16_t width;
+@@ -155,6 +184,9 @@ static const struct imgdata_ops_s g_cam_ops =
+   .stop_capture           = esp32s3_cam_stop_capture,
+ };
+ 
++static struct esp32s3_dmadesc_s
++  g_cam_dmadesc[ESP32S3_CAM_FRAME_SLOTS][ESP32S3_CAM_DMADESC_NUM];
++
+ static struct esp32s3_cam_s g_cam_priv =
+ {
+   .data =
+@@ -167,9 +199,10 @@ static struct esp32s3_cam_s g_cam_priv =
+  * Private Functions
+  ****************************************************************************/
+ 
+-static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
++static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv,
++                                  struct esp32s3_cam_slot_s *slot)
+ {
+-  uint8_t *pbuf = priv->fb;
++  uint8_t *pbuf = slot->fb;
+   uint32_t remaining = priv->fb_alloc;
+   uint32_t total_desc;
+   uint32_t i;
+@@ -186,17 +219,17 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
+                  ESP32S3_CAM_DMA_BUFLEN : remaining;
+       buf_len = (data_len + 63) & ~63;
+ 
+-      priv->dmadesc[i].ctrl = ESP32S3_DMA_CTRL_OWN |
++      slot->dmadesc[i].ctrl = ESP32S3_DMA_CTRL_OWN |
+           (buf_len << ESP32S3_DMA_CTRL_BUFLEN_S);
+-      priv->dmadesc[i].pbuf = pbuf;
++      slot->dmadesc[i].pbuf = pbuf;
+ 
+       if (i < total_desc - 1)
+         {
+-          priv->dmadesc[i].next = &priv->dmadesc[i + 1];
++          slot->dmadesc[i].next = &slot->dmadesc[i + 1];
+         }
+       else
+         {
+-          priv->dmadesc[i].next = NULL;
++          slot->dmadesc[i].next = NULL;
+         }
+ 
+       pbuf += data_len;
+@@ -204,36 +237,196 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
+     }
+ }
+ 
++static uint64_t esp32s3_cam_time_diff_us(const struct timeval *end,
++                                         const struct timeval *start)
++{
++  int64_t sec;
++  int64_t usec;
++
++  sec = end->tv_sec - start->tv_sec;
++  usec = end->tv_usec - start->tv_usec;
++  usec += sec * 1000000;
++  return usec < 0 ? 0 : (uint64_t)usec;
++}
++
++static void esp32s3_cam_prepare_slot(struct esp32s3_cam_s *priv,
++                                     struct esp32s3_cam_slot_s *slot)
++{
++  memset(slot->fb, 0, priv->fb_alloc);
++  esp32s3_cam_setup_dma(priv, slot);
++  up_clean_dcache((uintptr_t)slot->fb,
++                  (uintptr_t)slot->fb + priv->fb_alloc);
++}
++
++static uint32_t
++esp32s3_cam_dma_received(struct esp32s3_cam_s *priv,
++                         struct esp32s3_cam_slot_s *slot)
++{
++  uint32_t received = 0;
++  uint32_t total_desc;
++  uint32_t i;
++
++  total_desc = (priv->fb_alloc + ESP32S3_CAM_DMA_BUFLEN - 1) /
++               ESP32S3_CAM_DMA_BUFLEN;
++
++  for (i = 0; i < total_desc && i < ESP32S3_CAM_DMADESC_NUM; i++)
++    {
++      uint32_t ctrl = slot->dmadesc[i].ctrl;
++      uint32_t length;
++
++      if ((ctrl & ESP32S3_DMA_CTRL_OWN) != 0)
++        {
++          break;
++        }
++
++      length = (ctrl >> ESP32S3_DMA_CTRL_DATALEN_S) &
++               ESP32S3_DMA_CTRL_DATALEN_V;
++      if (length == 0)
++        {
++          break;
++        }
++
++      received += length;
++    }
++
++  return received > priv->fb_alloc ? priv->fb_alloc : received;
++}
++
++static int esp32s3_cam_start_slot(struct esp32s3_cam_s *priv,
++                                  struct esp32s3_cam_slot_s *slot)
++{
++  irqstate_t flags;
++  uint32_t regval;
++
++  if (slot->fb == NULL)
++    {
++      return -EINVAL;
++    }
++
++  esp32s3_cam_prepare_slot(priv, slot);
++
++  flags = spin_lock_irqsave(&priv->lock);
++  if (!priv->streaming || priv->capturing ||
++      slot->state != ESP32S3_CAM_SLOT_FREE)
++    {
++      spin_unlock_irqrestore(&priv->lock, flags);
++      return -EBUSY;
++    }
++
++  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
++  regval &= ~LCD_CAM_CAM_START_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++
++  regval |= LCD_CAM_CAM_RESET_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++  regval &= ~LCD_CAM_CAM_RESET_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++
++  regval |= LCD_CAM_CAM_AFIFO_RESET_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++  regval &= ~LCD_CAM_CAM_AFIFO_RESET_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++
++  esp32s3_dma_reset_channel(priv->dma_channel, false);
++  esp32s3_dma_load(slot->dmadesc, priv->dma_channel, false);
++  esp32s3_dma_enable(priv->dma_channel, false);
++
++  regval = getreg32(LCD_CAM_CAM_CTRL_REG);
++  regval |= LCD_CAM_CAM_UPDATE_REG_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL_REG);
++
++  gettimeofday(&slot->arm_ts, NULL);
++  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
++  regval |= LCD_CAM_CAM_START_M;
++  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++
++  priv->active_slot = slot->index;
++  priv->vsync_cnt = 0;
++  slot->state = ESP32S3_CAM_SLOT_CAPTURING;
++  priv->capturing = true;
++
++  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
++                         CAM_V_SYNC_IDX, false);
++  up_udelay(10);
++  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
++                         CAM_V_SYNC_IDX, true);
++
++  /* The GPIO-matrix pulse above synchronizes LCD_CAM to the beginning of a
++   * new software frame.  Account for that pulse here so the next physical
++   * VSYNC completes the frame.  Waiting for two additional physical VSYNCs
++   * discards a full sensor period on every capture.
++   */
++
++  putreg32(LCD_CAM_CAM_VSYNC_INT_CLR_M,
++           LCD_CAM_LC_DMA_INT_CLR_REG);
++  gettimeofday(&slot->first_vsync_ts, NULL);
++  priv->vsync_cnt = 1;
++
++  spin_unlock_irqrestore(&priv->lock, flags);
++  return OK;
++}
++
+ static void frame_complete_worker(void *arg)
+ {
+-  struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
++  struct esp32s3_cam_slot_s *slot =
++    (struct esp32s3_cam_slot_s *)arg;
++  struct esp32s3_cam_s *priv = slot->priv;
++  struct esp32s3_cam_slot_s *next;
++  imgdata_capture_t cb;
++  uint8_t *v4l2_buf;
++  struct timeval worker_ts;
++  struct timeval restart_ts;
++  struct timeval done_ts;
+   uint32_t data_offset = 0;
+   uint32_t data_size = priv->fb_size;
++  uint32_t scan_size;
+   uint32_t i;
++  int restart_ret;
+ 
+-  if (priv->cb == NULL || priv->fb == NULL)
++  if (slot->fb == NULL)
+     {
+       return;
+     }
+ 
+-  up_invalidate_dcache((uintptr_t)priv->fb,
+-                       (uintptr_t)priv->fb + priv->fb_alloc);
++  gettimeofday(&worker_ts, NULL);
++  next = &priv->slots[(slot->index + 1) % ESP32S3_CAM_FRAME_SLOTS];
++  restart_ret = OK;
++  if (!priv->capturing)
++    {
++      restart_ret = esp32s3_cam_start_slot(priv, next);
++    }
++
++  gettimeofday(&restart_ts, NULL);
++  if (restart_ret < 0)
++    {
++      priv->stat_restart_failures++;
++    }
++
++  up_invalidate_dcache((uintptr_t)slot->fb,
++                       (uintptr_t)slot->fb + priv->fb_alloc);
++
++  scan_size = esp32s3_cam_dma_received(priv, slot);
++  if (scan_size < 4)
++    {
++      scan_size = priv->fb_alloc;
++    }
+ 
+   if (priv->pixfmt == IMGDATA_PIX_FMT_JPEG)
+     {
+       bool found_soi = false;
+ 
+       data_size = 0;
+-      for (i = 0; i + 1 < priv->fb_alloc; i++)
++      for (i = 0; i + 1 < scan_size; i++)
+         {
+-          if (!found_soi && priv->fb[i] == 0xff && priv->fb[i + 1] == 0xd8)
++          if (!found_soi && slot->fb[i] == 0xff &&
++              slot->fb[i + 1] == 0xd8)
+             {
+               data_offset = i;
+               found_soi = true;
+               i++;
+             }
+-          else if (found_soi && priv->fb[i] == 0xff &&
+-                   priv->fb[i + 1] == 0xd9)
++          else if (found_soi && slot->fb[i] == 0xff &&
++                   slot->fb[i + 1] == 0xd9)
+             {
+               data_size = i + 2 - data_offset;
+               break;
+@@ -242,17 +435,79 @@ static void frame_complete_worker(void *arg)
+ 
+       if (data_size == 0 || data_size > priv->fb_size)
+         {
+-          priv->cb(EIO, 0, &priv->frame_ts, priv->cb_arg);
+-          return;
++          cb = priv->cb;
++          if (priv->streaming && cb != NULL)
++            {
++              cb(EIO, 0, &slot->frame_ts, priv->cb_arg);
++            }
++
++          goto release_slot;
+         }
+     }
+ 
+-  if (priv->v4l2_buf != NULL)
++  v4l2_buf = priv->v4l2_buf;
++  if (v4l2_buf != NULL)
++    {
++      memcpy(v4l2_buf, slot->fb + data_offset, data_size);
++    }
++
++  cb = priv->cb;
++  if (priv->streaming && cb != NULL)
+     {
+-      memcpy(priv->v4l2_buf, priv->fb + data_offset, data_size);
++      cb(0, data_size, &slot->frame_ts, priv->cb_arg);
+     }
+ 
+-  priv->cb(0, data_size, &priv->frame_ts, priv->cb_arg);
++release_slot:
++  if (priv->streaming)
++    {
++      esp32s3_cam_prepare_slot(priv, slot);
++    }
++
++  slot->state = ESP32S3_CAM_SLOT_FREE;
++
++  /* If processing temporarily fell behind and no alternate slot could be
++   * started, resume capture as soon as this slot becomes free.
++   */
++
++  if (priv->streaming && !priv->capturing)
++    {
++      esp32s3_cam_start_slot(priv, slot);
++    }
++
++  gettimeofday(&done_ts, NULL);
++  priv->stat_frames++;
++  priv->stat_arm_first_us +=
++    esp32s3_cam_time_diff_us(&slot->first_vsync_ts, &slot->arm_ts);
++  priv->stat_frame_us +=
++    esp32s3_cam_time_diff_us(&slot->frame_ts, &slot->first_vsync_ts);
++  priv->stat_irq_work_us +=
++    esp32s3_cam_time_diff_us(&worker_ts, &slot->frame_ts);
++  priv->stat_restart_us +=
++    esp32s3_cam_time_diff_us(&restart_ts, &worker_ts);
++  priv->stat_process_us +=
++    esp32s3_cam_time_diff_us(&done_ts, &restart_ts);
++
++  if (priv->stat_frames >= ESP32S3_CAM_STATS_FRAMES)
++    {
++      printf("CAM: timing frames=%" PRIu32 " arm_first_avg_us=%" PRIu64
++             " frame_avg_us=%" PRIu64 " irq_work_avg_us=%" PRIu64
++             " restart_avg_us=%" PRIu64 " process_avg_us=%" PRIu64
++             " restart_failures=%" PRIu32 "\n",
++             priv->stat_frames,
++             priv->stat_arm_first_us / priv->stat_frames,
++             priv->stat_frame_us / priv->stat_frames,
++             priv->stat_irq_work_us / priv->stat_frames,
++             priv->stat_restart_us / priv->stat_frames,
++             priv->stat_process_us / priv->stat_frames,
++             priv->stat_restart_failures);
++      priv->stat_frames = 0;
++      priv->stat_restart_failures = 0;
++      priv->stat_arm_first_us = 0;
++      priv->stat_frame_us = 0;
++      priv->stat_irq_work_us = 0;
++      priv->stat_restart_us = 0;
++      priv->stat_process_us = 0;
++    }
+ }
+ 
+ /****************************************************************************
+@@ -285,21 +540,23 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+ 
+           if (priv->vsync_cnt == 1)
+             {
++              gettimeofday(&priv->slots[priv->active_slot].first_vsync_ts,
++                           NULL);
++
+               /* Frame capture just started, DMA is now receiving data.
+                * Nothing to do here — wait for next VSYNC.
+                */
+             }
+           else if (priv->vsync_cnt >= 2 && priv->cb)
+             {
++              struct esp32s3_cam_slot_s *slot;
++              struct esp32s3_cam_slot_s *next;
++              uint32_t linkreg;
+               uint32_t regval;
+ 
+-              regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-              regval &= ~LCD_CAM_CAM_START_M;
+-              putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-
+-              regval = getreg32(LCD_CAM_CAM_CTRL_REG);
+-              regval |= LCD_CAM_CAM_UPDATE_REG_M;
+-              putreg32(regval, LCD_CAM_CAM_CTRL_REG);
++              slot = &priv->slots[priv->active_slot];
++              next = &priv->slots[(slot->index + 1) %
++                                  ESP32S3_CAM_FRAME_SLOTS];
+ 
+               SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
+                                priv->dma_channel,
+@@ -317,10 +574,51 @@ static int IRAM_ATTR cam_interrupt(int irq, void *context, void *arg)
+                     }
+                 }
+ 
+-              priv->capturing = false;
+-              gettimeofday(&priv->frame_ts, NULL);
+-              work_queue(LPWORK, &priv->frame_work,
+-                         frame_complete_worker, priv, 0);
++              slot->state = ESP32S3_CAM_SLOT_PENDING;
++              gettimeofday(&slot->frame_ts, NULL);
++
++              if (ESP32S3_CAM_CONTINUOUS_DMA &&
++                  next->state == ESP32S3_CAM_SLOT_FREE)
++                {
++                  SET_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG,
++                                   priv->dma_channel,
++                                   DMA_IN_RST_CH0_M);
++                  CLR_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG,
++                                   priv->dma_channel,
++                                   DMA_IN_RST_CH0_M);
++
++                  linkreg = (uint32_t)next->dmadesc &
++                            DMA_INLINK_ADDR_CH0;
++                  CLR_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
++                                   priv->dma_channel,
++                                   DMA_INLINK_ADDR_CH0);
++                  SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
++                                   priv->dma_channel, linkreg);
++                  SET_GDMA_CH_BITS(DMA_IN_LINK_CH0_REG,
++                                   priv->dma_channel,
++                                   DMA_INLINK_START_CH0_M);
++
++                  priv->active_slot = next->index;
++                  next->state = ESP32S3_CAM_SLOT_CAPTURING;
++                  next->arm_ts = slot->frame_ts;
++                  next->first_vsync_ts = slot->frame_ts;
++                  priv->vsync_cnt = 1;
++                  priv->capturing = true;
++                }
++              else
++                {
++                  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
++                  regval &= ~LCD_CAM_CAM_START_M;
++                  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++
++                  regval = getreg32(LCD_CAM_CAM_CTRL_REG);
++                  regval |= LCD_CAM_CAM_UPDATE_REG_M;
++                  putreg32(regval, LCD_CAM_CAM_CTRL_REG);
++                  priv->capturing = false;
++                }
++
++              work_queue(ESP32S3_CAM_WORK_QUEUE, &slot->work,
++                         frame_complete_worker, slot, 0);
+             }
+         }
+     }
+@@ -574,19 +872,29 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+ static int esp32s3_cam_init(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
++  unsigned int i;
+ 
++  priv->streaming = false;
+   priv->capturing = false;
+   priv->cb = NULL;
+   priv->cb_arg = NULL;
+-  priv->fb = NULL;
+   priv->fb_size = 0;
+-  priv->fb_pos = 0;
++  priv->fb_alloc = 0;
+   priv->width = 0;
+   priv->height = 0;
+   priv->pixfmt = 0;
+ 
+   spin_lock_init(&priv->lock);
+ 
++  for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
++    {
++      priv->slots[i].priv = priv;
++      priv->slots[i].dmadesc = g_cam_dmadesc[i];
++      priv->slots[i].fb = NULL;
++      priv->slots[i].index = i;
++      priv->slots[i].state = ESP32S3_CAM_SLOT_FREE;
++    }
++
+   printf("CAM: IMGDATA init begin\n");
+ 
+   /* Configure GPIO pins */
+@@ -611,9 +919,17 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+ static int esp32s3_cam_uninit(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
++  unsigned int i;
+   uint32_t regval;
+ 
+-  work_cancel_sync(LPWORK, &priv->frame_work);
++  printf("CAM: IMGDATA uninit begin cpuint=%d dma=%ld\n",
++         priv->cpuint, (long)priv->dma_channel);
++
++  priv->streaming = false;
++  for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
++    {
++      work_cancel_sync(ESP32S3_CAM_WORK_QUEUE, &priv->slots[i].work);
++    }
+ 
+   /* Stop capture */
+ 
+@@ -637,14 +953,19 @@ static int esp32s3_cam_uninit(struct imgdata_s *data)
+ 
+   /* Free frame buffer */
+ 
+-  if (priv->fb)
++  for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
+     {
+-      kmm_free(priv->fb);
+-      priv->fb = NULL;
++      if (priv->slots[i].fb != NULL)
++        {
++          kmm_free(priv->slots[i].fb);
++          priv->slots[i].fb = NULL;
++        }
+     }
+ 
+   priv->capturing = false;
+ 
++  printf("CAM: IMGDATA uninit done\n");
++
+   return OK;
+ }
+ 
+@@ -658,6 +979,7 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
+                                uint8_t *addr, uint32_t size)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
++  unsigned int i;
+   uint32_t needed_size;
+   uint32_t alloc_size;
+ 
+@@ -678,19 +1000,44 @@ static int esp32s3_cam_set_buf(struct imgdata_s *data,
+ 
+   alloc_size = needed_size + ESP32S3_CAM_HALF_BUF_SIZE * 3;
+ 
+-  if (priv->fb == NULL || priv->fb_size != needed_size)
++  if (alloc_size > ESP32S3_CAM_DMA_BUFLEN * ESP32S3_CAM_DMADESC_NUM)
+     {
+-      if (priv->fb != NULL)
++      snerr("ERROR: Camera frame buffer is too large: %" PRIu32 "\n",
++            alloc_size);
++      return -E2BIG;
++    }
++
++  if (priv->slots[0].fb == NULL || priv->fb_size != needed_size)
++    {
++      for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
+         {
+-          kmm_free(priv->fb);
+-          priv->fb = NULL;
++          if (priv->slots[i].fb != NULL)
++            {
++              kmm_free(priv->slots[i].fb);
++              priv->slots[i].fb = NULL;
++            }
+         }
+ 
+-      priv->fb = kmm_memalign(64, alloc_size);
+-      if (!priv->fb)
++      for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
+         {
+-          snerr("ERROR: Failed to allocate frame buffer\n");
+-          return -ENOMEM;
++          priv->slots[i].fb = kmm_memalign(64, alloc_size);
++          if (priv->slots[i].fb == NULL)
++            {
++              snerr("ERROR: Failed to allocate camera slot %u\n", i);
++              while (i > 0)
++                {
++                  i--;
++                  kmm_free(priv->slots[i].fb);
++                  priv->slots[i].fb = NULL;
++                }
++
++              return -ENOMEM;
++            }
++
++          memset(priv->slots[i].fb, 0, alloc_size);
++          printf("CAM: slot %u buffer=%p bytes=%" PRIu32 "\n",
++                 i, priv->slots[i].fb, alloc_size);
++          priv->slots[i].state = ESP32S3_CAM_SLOT_FREE;
+         }
+ 
+       priv->fb_size = needed_size;
+@@ -740,80 +1087,45 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
+   uint32_t regval;
++  int ret;
+ 
+-  if (priv->capturing)
++  if (priv->streaming)
+     {
+       return -EBUSY;
+     }
+ 
+-  if (!priv->fb)
++  if (priv->slots[0].fb == NULL)
+     {
+       return -EINVAL;
+     }
+ 
+   priv->cb = callback;
+   priv->cb_arg = arg;
+-  priv->fb_pos = 0;
+-  priv->vsync_cnt = 0;
+-  priv->dma_received = 0;
+-  priv->dma_desc_offset = 0;
+-
+-  memset(priv->fb, 0, priv->fb_alloc);
+-
+-  /* Rebuild DMA descriptors (reset OWN bits consumed by prior DMA) */
+-
+-  esp32s3_cam_setup_dma(priv);
+-
+-  up_clean_dcache((uintptr_t)priv->fb,
+-                  (uintptr_t)priv->fb + priv->fb_alloc);
+-
+-  /* Stop CAM first */
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-  regval &= ~LCD_CAM_CAM_START_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-
+-  /* Reset CAM module + AFIFO */
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-  regval |= LCD_CAM_CAM_RESET_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-  regval &= ~LCD_CAM_CAM_RESET_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-
+-  regval |= LCD_CAM_CAM_AFIFO_RESET_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-  regval &= ~LCD_CAM_CAM_AFIFO_RESET_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+-
+-  /* Reset DMA channel */
+-
+-  esp32s3_dma_reset_channel(priv->dma_channel, false);
+-
+-  /* Load DMA descriptors */
+-
+-  esp32s3_dma_load(priv->dmadesc, priv->dma_channel, false);
+-  esp32s3_dma_enable(priv->dma_channel, false);
+-
+-  /* cam_update BEFORE cam_start */
++  priv->stat_frames = 0;
++  priv->stat_restart_failures = 0;
++  priv->stat_arm_first_us = 0;
++  priv->stat_frame_us = 0;
++  priv->stat_irq_work_us = 0;
++  priv->stat_restart_us = 0;
++  priv->stat_process_us = 0;
++  priv->streaming = true;
+ 
+-  regval = getreg32(LCD_CAM_CAM_CTRL_REG);
+-  regval |= LCD_CAM_CAM_UPDATE_REG_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL_REG);
+-
+-  regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+-  regval |= LCD_CAM_CAM_START_M;
+-  putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
++  putreg32(0xffffffff, LCD_CAM_LC_DMA_INT_CLR_REG);
++  regval = getreg32(LCD_CAM_LC_DMA_INT_ENA_REG);
++  regval |= LCD_CAM_CAM_VSYNC_INT_ENA_M;
++  putreg32(regval, LCD_CAM_LC_DMA_INT_ENA_REG);
+ 
+-  priv->capturing = true;
++  esp32s3_cam_prepare_slot(priv, &priv->slots[1]);
+ 
+-  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+-                         CAM_V_SYNC_IDX, false);
+-  up_udelay(10);
+-  esp32s3_gpio_matrix_in(CONFIG_ESP32S3_CAM_VSYNC_PIN,
+-                         CAM_V_SYNC_IDX, true);
++  ret = esp32s3_cam_start_slot(priv, &priv->slots[0]);
++  if (ret < 0)
++    {
++      priv->streaming = false;
++      priv->cb = NULL;
++      priv->cb_arg = NULL;
++    }
+ 
+-  return OK;
++  return ret;
+ }
+ 
+ /****************************************************************************
+@@ -823,8 +1135,14 @@ static int esp32s3_cam_start_capture(struct imgdata_s *data,
+ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)data;
++  irqstate_t flags;
++  unsigned int i;
++  bool dma_parked = false;
+   uint32_t regval;
+ 
++  flags = spin_lock_irqsave(&priv->lock);
++  priv->streaming = false;
++
+   regval = getreg32(LCD_CAM_CAM_CTRL1_REG);
+   regval &= ~LCD_CAM_CAM_START_M;
+   putreg32(regval, LCD_CAM_CAM_CTRL1_REG);
+@@ -833,13 +1151,49 @@ static int esp32s3_cam_stop_capture(struct imgdata_s *data)
+   regval |= LCD_CAM_CAM_UPDATE_REG_M;
+   putreg32(regval, LCD_CAM_CAM_CTRL_REG);
+ 
++  putreg32(0, LCD_CAM_LC_DMA_INT_ENA_REG);
++  putreg32(0xffffffff, LCD_CAM_LC_DMA_INT_CLR_REG);
++
++  if (priv->dma_channel >= 0)
++    {
++      esp32s3_dma_disable(priv->dma_channel, false);
++      for (i = 0; i < 1000; i++)
++        {
++          uint32_t regaddr = DMA_IN_LINK_CH0_REG +
++                             priv->dma_channel * GDMA_REG_OFFSET;
++
++          if ((getreg32(regaddr) & DMA_INLINK_PARK_CH0) != 0)
++            {
++              dma_parked = true;
++              break;
++            }
++        }
++
++      esp32s3_dma_reset_channel(priv->dma_channel, false);
++    }
++
+   priv->capturing = false;
++  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+-  work_cancel_sync(LPWORK, &priv->frame_work);
++  for (i = 0; i < ESP32S3_CAM_FRAME_SLOTS; i++)
++    {
++      /* stop_capture() may be called from frame_complete_worker() through
++       * the V4L2 completion callback when no vacant buffer remains.  A
++       * synchronous cancellation would then wait for the current worker to
++       * finish itself.  Mark streaming stopped and cancel pending work here;
++       * uninit() performs the synchronous cancellation before resources are
++       * released.
++       */
++
++      work_cancel(ESP32S3_CAM_WORK_QUEUE, &priv->slots[i].work);
++      priv->slots[i].state = ESP32S3_CAM_SLOT_FREE;
++    }
+ 
+   priv->cb = NULL;
+   priv->cb_arg = NULL;
+ 
++  printf("CAM: stop complete dma_parked=%d\n", dma_parked);
++
+   return OK;
+ }
+ 
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+index 084e0868e43..00b393b2665 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
++++ b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+@@ -118,10 +118,11 @@ CONFIG_NETUTILS_IPERF=y
+ CONFIG_NET_BROADCAST=y
+ CONFIG_NET_ETH_PKTSIZE=1514
+ CONFIG_NET_ICMP_SOCKET=y
+-CONFIG_NET_SEND_BUFSIZE=4096
++CONFIG_NET_SEND_BUFSIZE=16384
+ CONFIG_NET_STATISTICS=y
+ CONFIG_NET_TCP=y
+ CONFIG_NET_TCPBACKLOG=y
++CONFIG_NET_TCPPROTO_OPTIONS=y
+ CONFIG_NET_TCP_DELAYED_ACK=y
+ CONFIG_NET_TCP_WRITE_BUFFERS=y
+ CONFIG_NET_UDP=y
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index 81803766651..30f02aef51c 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -15,6 +15,7 @@
+ #include <nuttx/config.h>
+ 
+ #include <errno.h>
++#include <stdbool.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <stdint.h>
+@@ -61,6 +62,8 @@ struct ov2640_regval_s {
+  * Private Data - OV2640 Register Tables
+  ****************************************************************************/
+ 
++static bool g_ov2640_initialized;
++
+ /* Phase 1: Soft reset */
+ 
+ static const struct ov2640_regval_s g_ov2640_reset[] = {
+@@ -419,6 +422,11 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+     FAR struct i2c_master_s* i2c;
+     int ret;
+ 
++    if (g_ov2640_initialized) {
++        printf("CAM: OV2640 already initialized\n");
++        return OK;
++    }
++
+     printf("CAM: OV2640 init begin\n");
+     ov2640_start_xclk();
+     syslog(LOG_INFO, "CAM: LEDC XCLK started on GPIO15\n");
+@@ -460,6 +468,7 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+ 
+     printf("CAM: CLKRC override=0x%02x\n", OV2640_CLKRC_BALANCED);
+ 
++    g_ov2640_initialized = true;
+     syslog(LOG_INFO, "OV2640 sensor configured for VGA JPEG\n");
+     return OK;
+ #else
+-- 
+2.25.1
+

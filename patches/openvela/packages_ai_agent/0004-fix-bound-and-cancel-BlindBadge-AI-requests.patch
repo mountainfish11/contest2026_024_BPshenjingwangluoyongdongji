@@ -1,0 +1,367 @@
+From 9619990df42a200274d82ffe82ae56f872c2af00 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Tue, 3 Nov 2026 23:40:46 +0800
+Subject: [PATCH 4/6] fix: bound and cancel BlindBadge AI requests
+
+---
+ include/agent_config.h |   2 +-
+ src/infra/vela_tls.c   | 223 +++++++++++++++++++++++++++++++++++------
+ src/infra/vela_tls.h   |   9 ++
+ 3 files changed, 201 insertions(+), 33 deletions(-)
+
+diff --git a/include/agent_config.h b/include/agent_config.h
+index 02e71f6..1744bef 100644
+--- a/include/agent_config.h
++++ b/include/agent_config.h
+@@ -122,7 +122,7 @@
+  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
+  * watchdog to fire first on normal slow responses.  Set higher
+  * to cover TLS handshake + full response read. */
+-#define AGENT_LLM_SOCKET_TIMEOUT_SEC 30
++#define AGENT_LLM_SOCKET_TIMEOUT_SEC 120
+ 
+ /* ── Timezone (POSIX TZ format) ────────────────────────────── */
+ #define AGENT_TIMEZONE "CST-8"
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index 83e939b..8e4d737 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -31,6 +31,7 @@
+ 
+ /* POSIX networking */
+ #include <netdb.h>
++#include <sys/select.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -61,7 +62,16 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
+ 
+ static const char* TAG = "vela_tls";
+ 
+-#define VELA_TLS_HANDSHAKE_TIMEOUT_SEC 15
++#define VELA_TLS_CONNECT_TIMEOUT_SEC 10
++
++static volatile int s_request_timeout_sec;
++
++static int tls_request_timeout(void)
++{
++    int timeout_sec = s_request_timeout_sec;
++
++    return timeout_sec > 0 ? timeout_sec : AGENT_LLM_SOCKET_TIMEOUT_SEC;
++}
+ 
+ /* ── Chunked transfer decoding ───────────────────────────────── */
+ 
+@@ -276,16 +286,139 @@ void vela_tls_abort_active(void)
+     pthread_mutex_lock(&s_pool_lock);
+     for (int i = 0; i < CONN_POOL_SIZE; i++) {
+         if (s_pool[i].in_use && s_pool[i].ctx.net.fd >= 0) {
+-            shutdown(s_pool[i].ctx.net.fd, SHUT_RDWR);
++            int fd = s_pool[i].ctx.net.fd;
++
++            shutdown(fd, SHUT_RDWR);
++            s_pool[i].ctx.net.fd = -1;
++            close(fd);
+         }
+     }
+     pthread_mutex_unlock(&s_pool_lock);
+ }
+ 
++void vela_tls_set_request_timeout(int timeout_sec)
++{
++    s_request_timeout_sec = timeout_sec > 0 ? timeout_sec : 0;
++}
++
++void vela_tls_reset_aborted(void)
++{
++    pthread_mutex_lock(&s_pool_lock);
++    for (int i = 0; i < CONN_POOL_SIZE; i++) {
++        if (s_pool[i].in_use) {
++            tls_ctx_free(&s_pool[i].ctx);
++            memset(&s_pool[i], 0, sizeof(s_pool[i]));
++            s_pool[i].ctx.net.fd = -1;
++        }
++    }
++    pthread_mutex_unlock(&s_pool_lock);
++}
++
++static int tls_tcp_connect(tls_ctx_t* ctx, const char* host,
++    const char* port, int timeout_sec)
++{
++    struct addrinfo hints;
++    struct addrinfo* addresses = NULL;
++    struct addrinfo* address;
++    int last_error = 0;
++    int ret;
++
++    memset(&hints, 0, sizeof(hints));
++    hints.ai_family = AF_UNSPEC;
++    hints.ai_socktype = SOCK_STREAM;
++    hints.ai_protocol = IPPROTO_TCP;
++
++    ret = getaddrinfo(host, port, &hints, &addresses);
++    if (ret != 0 || addresses == NULL) {
++        syslog(LOG_ERR, "[%s] DNS lookup failed for %s:%s: %d\n",
++            TAG, host, port, ret);
++        errno = EHOSTUNREACH;
++        return -1;
++    }
++
++    for (address = addresses; address != NULL;
++         address = address->ai_next) {
++        fd_set writefds;
++        struct timeval timeout;
++        socklen_t error_len;
++        int error = 0;
++        int flags;
++        int fd;
++
++        fd = socket(address->ai_family, address->ai_socktype,
++            address->ai_protocol);
++        if (fd < 0) {
++            last_error = errno;
++            continue;
++        }
++
++        flags = fcntl(fd, F_GETFL, 0);
++        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
++            last_error = errno;
++            close(fd);
++            continue;
++        }
++
++        /* Publish the fd before waiting so a service cancellation can close
++         * the in-progress connection through vela_tls_abort_active(). */
++
++        ctx->net.fd = fd;
++        ret = connect(fd, address->ai_addr, address->ai_addrlen);
++        if (ret < 0 && errno != EINPROGRESS) {
++            last_error = errno;
++            close(fd);
++            ctx->net.fd = -1;
++            continue;
++        }
++
++        if (ret < 0) {
++            FD_ZERO(&writefds);
++            FD_SET(fd, &writefds);
++            timeout.tv_sec = timeout_sec;
++            timeout.tv_usec = 0;
++
++            ret = select(fd + 1, NULL, &writefds, NULL, &timeout);
++            if (ctx->net.fd != fd) {
++                last_error = ECANCELED;
++                break;
++            }
++
++            if (ret <= 0) {
++                last_error = ret == 0 ? ETIMEDOUT : errno;
++                close(fd);
++                ctx->net.fd = -1;
++                continue;
++            }
++
++            error_len = sizeof(error);
++            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
++                    &error_len) < 0 || error != 0) {
++                last_error = error != 0 ? error : errno;
++                close(fd);
++                ctx->net.fd = -1;
++                continue;
++            }
++        }
++
++        if (fcntl(fd, F_SETFL, flags) < 0) {
++            last_error = errno;
++            close(fd);
++            ctx->net.fd = -1;
++            continue;
++        }
++
++        freeaddrinfo(addresses);
++        return 0;
++    }
++
++    freeaddrinfo(addresses);
++    errno = last_error;
++    return -1;
++}
++
+ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+ {
+-    int handshake_timeout_sec = VELA_TLS_HANDSHAKE_TIMEOUT_SEC;
+-    int read_timeout_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC;
++    int request_timeout_sec = tls_request_timeout();
+     int ret;
+ 
+     mbedtls_ssl_init(&ctx->ssl);
+@@ -335,22 +468,19 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
+             TAG, tunnel_fd, host, port);
+     } else {
+-        if ((ret = mbedtls_net_connect(&ctx->net, host, port,
+-                 MBEDTLS_NET_PROTO_TCP))
+-            != 0) {
++        ret = tls_tcp_connect(ctx, host, port,
++            VELA_TLS_CONNECT_TIMEOUT_SEC);
++        if (ret != 0) {
+             fprintf(stderr,
+-                "[ai_agent] TCP connect %s:%s failed: mbedtls=-0x%04x errno=%d\n",
+-                host, port, -ret, errno);
+-            syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
+-                TAG, host, port, -ret);
++                "[ai_agent] TCP connect %s:%s failed: errno=%d\n",
++                host, port, errno);
++            syslog(LOG_ERR, "[%s] timed connect %s:%s failed: errno=%d\n",
++                TAG, host, port, errno);
+             return VELA_TLS_ERR_CONNECT;
+         }
+     }
+ 
+-    /* Force blocking mode and use the shorter connect timeout while the TLS
+-     * handshake is in progress.  A timed-out blocking recv is reported by
+-     * mbedTLS as WANT_READ, so the handshake loop below also has an explicit
+-     * deadline instead of retrying WANT_READ forever.
++    /* Force blocking mode and set socket-level read timeout.
+      * This avoids using select()/poll() inside mbedtls_net_recv_timeout
+      * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
+      * Timeout is configured via AGENT_LLM_SOCKET_TIMEOUT_SEC in
+@@ -359,13 +489,21 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+     mbedtls_net_set_block(&ctx->net);
+     if (ctx->net.fd >= 0) {
+ #ifdef CONFIG_AI_AGENT_NET_RPMSG
+-        handshake_timeout_sec = network_get_connect_timeout();
+-        read_timeout_sec = network_get_read_timeout();
+-#endif
+-        struct timeval tv = { .tv_sec = handshake_timeout_sec,
++        int read_timeout_sec = network_get_read_timeout();
++        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
++#else
++        struct timeval tv = { .tv_sec = request_timeout_sec,
+             .tv_usec = 0 };
++#endif
+         setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+-        setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++
++#ifdef CONFIG_AI_AGENT_NET_RPMSG
++        {
++            int timeout_sec = network_get_connect_timeout();
++            struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
++            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
++        }
++#endif
+     }
+ 
+     /* SSL config: client, TLS, default ciphersuites */
+@@ -425,10 +563,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
+         mbedtls_net_send, mbedtls_net_recv, NULL);
+ 
+-    /* Handshake */
++    /* Handshake.  A blocking socket timeout is reported by mbedTLS as
++     * WANT_READ, so retain an explicit deadline to prevent an endless loop.
++     */
++
+     struct timespec handshake_deadline;
+     clock_gettime(CLOCK_MONOTONIC, &handshake_deadline);
+-    handshake_deadline.tv_sec += handshake_timeout_sec;
++    handshake_deadline.tv_sec += request_timeout_sec;
+     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+         if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+             ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+@@ -439,9 +580,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+                 (current_time.tv_sec == handshake_deadline.tv_sec &&
+                  current_time.tv_nsec >= handshake_deadline.tv_nsec)) {
+                 syslog(LOG_ERR, "[%s] TLS handshake timed out after %ds\n",
+-                    TAG, handshake_timeout_sec);
++                    TAG, request_timeout_sec);
+                 return VELA_TLS_ERR_HANDSHAKE;
+             }
++
+             continue;
+         }
+ 
+@@ -460,13 +602,6 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+             return VELA_TLS_ERR_HANDSHAKE;
+         }
+     }
+-
+-    if (ctx->net.fd >= 0) {
+-        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
+-
+-        setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+-    }
+-
+     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
+         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+ 
+@@ -708,12 +843,36 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
+                 tls_raw_release(raw);
+                 return VELA_TLS_ERR_READ;
+             } else {
+-                break;
++                syslog(LOG_ERR, "[%s] ssl_read (body) ret=0x%x\n",
++                    TAG, -ret);
++                tls_raw_release(raw);
++                return VELA_TLS_ERR_READ;
+             }
+         }
+     }
+ 
+     resp_buf[resp_pos] = '\0';
++
++    /* A successful HTTP status is not enough: never hand a partial body to
++     * the JSON parser.  Intermittent socket errors used to break the loop and
++     * return HTTP 200, which surfaced later as a misleading JSON parse error.
++     */
++
++    if (content_length >= 0 && (long)resp_pos < content_length) {
++        syslog(LOG_ERR,
++            "[%s] Incomplete TLS body: got=%zu expected=%ld\n",
++            TAG, resp_pos, content_length);
++        tls_raw_release(raw);
++        return VELA_TLS_ERR_READ;
++    }
++
++    if (chunked && !chunked_message_complete(resp_buf, resp_pos)) {
++        syslog(LOG_ERR, "[%s] Incomplete chunked TLS body: got=%zu\n",
++            TAG, resp_pos);
++        tls_raw_release(raw);
++        return VELA_TLS_ERR_READ;
++    }
++
+     tls_raw_release(raw);
+ 
+     /* Chunked decode */
+@@ -756,7 +915,7 @@ int vela_https_request(
+             int dr;
+             /* Temporarily set a very short socket timeout to drain without blocking */
+             struct timeval tv_drain = { .tv_sec = 0, .tv_usec = 10000 }; /* 10ms */
+-            struct timeval tv_orig = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
++            struct timeval tv_orig = { .tv_sec = tls_request_timeout(),
+                 .tv_usec = 0 };
+             setsockopt(slot->ctx.net.fd, SOL_SOCKET, SO_RCVTIMEO,
+                 &tv_drain, sizeof(tv_drain));
+diff --git a/src/infra/vela_tls.h b/src/infra/vela_tls.h
+index a07b408..f709b40 100644
+--- a/src/infra/vela_tls.h
++++ b/src/infra/vela_tls.h
+@@ -120,6 +120,15 @@ void vela_tls_pool_cleanup(void);
+ 
+ void vela_tls_abort_active(void);
+ 
++/* Override the socket/handshake timeout for the current application-level
++ * request class.  Pass 0 to restore AGENT_LLM_SOCKET_TIMEOUT_SEC. */
++
++void vela_tls_set_request_timeout(int timeout_sec);
++
++/* Reset request-owned pool slots after their worker has been stopped. */
++
++void vela_tls_reset_aborted(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.25.1
+

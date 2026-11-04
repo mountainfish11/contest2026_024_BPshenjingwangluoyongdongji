@@ -1,0 +1,40 @@
+From c463b969d1451a69b1836145112e91e49977ec48 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Wed, 4 Nov 2026 09:47:35 +0800
+Subject: [PATCH 6/6] fix: avoid blocking background TLS errors
+
+---
+ src/infra/vela_tls.c | 3 ---
+ src/llm/llm_proxy.c  | 2 --
+ 2 files changed, 5 deletions(-)
+
+diff --git a/src/infra/vela_tls.c b/src/infra/vela_tls.c
+index fadcbe5..d2e8a87 100644
+--- a/src/infra/vela_tls.c
++++ b/src/infra/vela_tls.c
+@@ -471,9 +471,6 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+         ret = tls_tcp_connect(ctx, host, port,
+             VELA_TLS_CONNECT_TIMEOUT_SEC);
+         if (ret != 0) {
+-            fprintf(stderr,
+-                "[ai_agent] TCP connect %s:%s failed: errno=%d\n",
+-                host, port, errno);
+             syslog(LOG_ERR, "[%s] timed connect %s:%s failed: errno=%d\n",
+                 TAG, host, port, errno);
+             return VELA_TLS_ERR_CONNECT;
+diff --git a/src/llm/llm_proxy.c b/src/llm/llm_proxy.c
+index 14f7abf..326d70f 100644
+--- a/src/llm/llm_proxy.c
++++ b/src/llm/llm_proxy.c
+@@ -316,8 +316,6 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
+     }
+ 
+     if (status < 0) {
+-        fprintf(stderr, "[ai_agent] MiMo HTTPS failed at %s:%s%s: %d\n",
+-            llm_host, llm_port, llm_path, status);
+         resp_buf_free(rb);
+         return ERROR;
+     }
+-- 
+2.25.1
+

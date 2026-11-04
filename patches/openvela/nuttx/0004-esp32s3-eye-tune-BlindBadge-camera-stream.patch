@@ -1,0 +1,71 @@
+From e7327c6f2855f308fb389078cd5dbc6158cffb2c Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Sun, 25 Oct 2026 19:41:24 +0800
+Subject: [PATCH 4/9] esp32s3-eye: tune BlindBadge camera stream
+
+---
+ .../esp32s3-eye/configs/blindbadge/defconfig  |  4 +++-
+ .../esp32s3-eye/src/esp32s3_board_camera.c    | 20 +++++++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+index af04145f775..084e0868e43 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
++++ b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+@@ -111,12 +111,14 @@ CONFIG_NETDEV_PHY_IOCTL=y
+ CONFIG_NETDEV_WIRELESS_IOCTL=y
+ CONFIG_NETUTILS_CJSON=y
+ CONFIG_NETUTILS_DHCPD=y
+-CONFIG_NETUTILS_DHCPD_ROUTERIP=0xc0a80401
++CONFIG_NETUTILS_DHCPD_DNSIP=0x00000000
++CONFIG_NETUTILS_DHCPD_ROUTERIP=0x00000000
+ CONFIG_NETUTILS_DHCPD_STARTIP=0xc0a80402
+ CONFIG_NETUTILS_IPERF=y
+ CONFIG_NET_BROADCAST=y
+ CONFIG_NET_ETH_PKTSIZE=1514
+ CONFIG_NET_ICMP_SOCKET=y
++CONFIG_NET_SEND_BUFSIZE=4096
+ CONFIG_NET_STATISTICS=y
+ CONFIG_NET_TCP=y
+ CONFIG_NET_TCPBACKLOG=y
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index b54dc137ff2..81803766651 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -43,6 +43,7 @@
+ #define OV2640_I2C_ADDR 0x30
+ #define OV2640_I2C_BUS 0
+ #define OV2640_I2C_FREQ 100000
++#define OV2640_CLKRC_BALANCED 0x82
+ 
+ #define VGA_WIDTH 640
+ #define VGA_HEIGHT 480
+@@ -440,6 +441,25 @@ static int ov2640_init(FAR struct imgsensor_s *sensor)
+         return ret;
+       }
+ 
++    /* The common VGA table uses CLKRC=0x01 (10 MHz sensor clock), while
++     * CLKRC=0x00 was measured faster but starved SoftAP traffic.  Use the
++     * PLL with divider 2 for a board-local intermediate clock (~13.3 MHz).
++     */
++
++    ret = ov2640_write_reg(i2c, 0xff, 0x01);
++    if (ret >= 0)
++      {
++        ret = ov2640_write_reg(i2c, 0x11, OV2640_CLKRC_BALANCED);
++      }
++
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "CAM: CLKRC override failed: %d\n", ret);
++        return ret;
++      }
++
++    printf("CAM: CLKRC override=0x%02x\n", OV2640_CLKRC_BALANCED);
++
+     syslog(LOG_INFO, "OV2640 sensor configured for VGA JPEG\n");
+     return OK;
+ #else
+-- 
+2.25.1
+

@@ -1,0 +1,721 @@
+From 29efb8924a2a60512c5d59e7e03c63e5f7b4b442 Mon Sep 17 00:00:00 2001
+From: mountainfish11 <1096913405@qq.com>
+Date: Sat, 24 Oct 2026 20:25:26 +0800
+Subject: [PATCH 2/9] =?UTF-8?q?=E5=8D=95=E5=B8=A7=E5=B7=B2=E8=BF=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ arch/xtensa/src/esp32s3/esp32s3_cam.c         | 64 +++++++++++++++---
+ .../xtensa/src/esp32s3/esp32s3_wifi_adapter.c | 25 +++++++
+ arch/xtensa/src/esp32s3/esp32s3_wlan.c        | 64 +++++++++++++++---
+ arch/xtensa/src/esp32s3/esp32s3_wlan.h        |  1 +
+ .../esp32s3-eye/configs/blindbadge/defconfig  | 22 +++++-
+ .../esp32s3-eye/src/esp32s3_board_camera.c    | 67 ++++++++++++++-----
+ .../esp32s3/esp32s3-eye/src/esp32s3_boot.c    | 16 ++---
+ drivers/video/ov2640.c                        |  9 ++-
+ drivers/video/v4l2_cap.c                      | 10 ++-
+ 9 files changed, 227 insertions(+), 51 deletions(-)
+
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_cam.c b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+index 8c4e9feac63..5635e371114 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_cam.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_cam.c
+@@ -31,6 +31,7 @@
+ #include <string.h>
+ #include <assert.h>
+ #include <errno.h>
++#include <stdio.h>
+ #include <debug.h>
+ 
+ #include <nuttx/spinlock.h>
+@@ -73,7 +74,7 @@
+ /* DMA buffer configuration */
+ 
+ #define ESP32S3_CAM_DMA_BUFLEN    3840
+-#define ESP32S3_CAM_DMADESC_NUM   56
++#define ESP32S3_CAM_DMADESC_NUM   96
+ #define ESP32S3_CAM_HALF_BUF_SIZE 15360
+ 
+ /* VSYNC filter threshold */
+@@ -206,6 +207,9 @@ static void esp32s3_cam_setup_dma(struct esp32s3_cam_s *priv)
+ static void frame_complete_worker(void *arg)
+ {
+   struct esp32s3_cam_s *priv = (struct esp32s3_cam_s *)arg;
++  uint32_t data_offset = 0;
++  uint32_t data_size = priv->fb_size;
++  uint32_t i;
+ 
+   if (priv->cb == NULL || priv->fb == NULL)
+     {
+@@ -213,14 +217,42 @@ static void frame_complete_worker(void *arg)
+     }
+ 
+   up_invalidate_dcache((uintptr_t)priv->fb,
+-                       (uintptr_t)priv->fb + priv->fb_size);
++                       (uintptr_t)priv->fb + priv->fb_alloc);
++
++  if (priv->pixfmt == IMGDATA_PIX_FMT_JPEG)
++    {
++      bool found_soi = false;
++
++      data_size = 0;
++      for (i = 0; i + 1 < priv->fb_alloc; i++)
++        {
++          if (!found_soi && priv->fb[i] == 0xff && priv->fb[i + 1] == 0xd8)
++            {
++              data_offset = i;
++              found_soi = true;
++              i++;
++            }
++          else if (found_soi && priv->fb[i] == 0xff &&
++                   priv->fb[i + 1] == 0xd9)
++            {
++              data_size = i + 2 - data_offset;
++              break;
++            }
++        }
++
++      if (data_size == 0 || data_size > priv->fb_size)
++        {
++          priv->cb(EIO, 0, &priv->frame_ts, priv->cb_arg);
++          return;
++        }
++    }
+ 
+   if (priv->v4l2_buf != NULL)
+     {
+-      memcpy(priv->v4l2_buf, priv->fb, priv->fb_size);
++      memcpy(priv->v4l2_buf, priv->fb + data_offset, data_size);
+     }
+ 
+-  priv->cb(0, priv->fb_size, &priv->frame_ts, priv->cb_arg);
++  priv->cb(0, data_size, &priv->frame_ts, priv->cb_arg);
+ }
+ 
+ /****************************************************************************
+@@ -409,8 +441,10 @@ static void esp32s3_cam_enableclk(void)
+ 
+ static int esp32s3_cam_dmasetup(struct esp32s3_cam_s *priv)
+ {
++  printf("CAM: GDMA request begin\n");
+   priv->dma_channel = esp32s3_dma_request(ESP32S3_DMA_PERIPH_LCDCAM,
+                                           1, 10, true);
++  printf("CAM: GDMA request ret=%ld\n", (long)priv->dma_channel);
+   if (priv->dma_channel < 0)
+     {
+       snerr("ERROR: Failed to allocate GDMA channel\n");
+@@ -438,6 +472,8 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+   uint32_t regval;
+   irqstate_t flags;
+ 
++  printf("CAM: controller config begin\n");
++
+   /* Reset CAM module and AFIFO first */
+ 
+   regval = LCD_CAM_CAM_RESET_M | LCD_CAM_CAM_AFIFO_RESET_M;
+@@ -467,15 +503,17 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+ 
+   putreg32(0, LCD_CAM_CAM_RGB_YUV_REG);
+ 
+-  CLR_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG, priv->dma_channel,
+-                   DMA_INDSCR_BURST_EN_CH0_M |
+-                   DMA_IN_DATA_BURST_EN_CH0_M);
+-
+   if (esp32s3_cam_dmasetup(priv) != OK)
+     {
+       return -ENOMEM;
+     }
+ 
++  CLR_GDMA_CH_BITS(DMA_IN_CONF0_CH0_REG, priv->dma_channel,
++                   DMA_INDSCR_BURST_EN_CH0_M |
++                   DMA_IN_DATA_BURST_EN_CH0_M);
++
++  printf("CAM: GDMA configured\n");
++
+   /* Disable all LCD_CAM interrupts and clear pending */
+ 
+   putreg32(0, LCD_CAM_LC_DMA_INT_ENA_REG);
+@@ -490,6 +528,7 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+    * won't be serviced until after irq_attach completes.
+    */
+ 
++  printf("CAM: IRQ setup begin\n");
+   flags = spin_lock_irqsave(&priv->lock);
+ 
+   priv->cpu = this_cpu();
+@@ -514,12 +553,17 @@ static int esp32s3_cam_config(struct esp32s3_cam_s *priv)
+ 
+   spin_unlock_irqrestore(&priv->lock, flags);
+ 
++  printf("CAM: IRQ setup done cpuint=%d attach=%d\n",
++         priv->cpuint, ret);
++
+   up_enable_irq(ESP32S3_IRQ_LCD_CAM);
+ 
+   regval = getreg32(LCD_CAM_LC_DMA_INT_ENA_REG);
+   regval |= LCD_CAM_CAM_VSYNC_INT_ENA_M;
+   putreg32(regval, LCD_CAM_LC_DMA_INT_ENA_REG);
+ 
++  printf("CAM: controller config done\n");
++
+   return OK;
+ }
+ 
+@@ -543,13 +587,17 @@ static int esp32s3_cam_init(struct imgdata_s *data)
+ 
+   spin_lock_init(&priv->lock);
+ 
++  printf("CAM: IMGDATA init begin\n");
++
+   /* Configure GPIO pins */
+ 
+   esp32s3_cam_gpio_config();
++  printf("CAM: GPIO configured\n");
+ 
+   /* Enable clock and configure XCLK */
+ 
+   esp32s3_cam_enableclk();
++  printf("CAM: peripheral clock configured\n");
+ 
+   /* Configure CAM controller */
+ 
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wifi_adapter.c b/arch/xtensa/src/esp32s3/esp32s3_wifi_adapter.c
+index 85824100d7f..983d140dadb 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wifi_adapter.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_wifi_adapter.c
+@@ -2241,10 +2241,21 @@ static void esp_evt_work_cb(void *arg)
+               {
+                 wlerr("Failed to get Wi-Fi config data ret=%d\n", ret);
+               }
++
++            ret = esp32s3_wlan_softap_set_linkstatus(true);
++            if (ret < 0)
++              {
++                wlerr("ERROR: Failed to set Wi-Fi SoftAP link status\n");
++              }
+             break;
+ 
+           case WIFI_ADPT_EVT_AP_STOP:
+             wlinfo("INFO: Wi-Fi softap stop\n");
++            ret = esp32s3_wlan_softap_set_linkstatus(false);
++            if (ret < 0)
++              {
++                wlerr("ERROR: Failed to clear Wi-Fi SoftAP link status\n");
++              }
+             break;
+ 
+           case WIFI_ADPT_EVT_AP_STACONNECTED:
+@@ -6016,6 +6027,20 @@ int esp_wifi_softap_start(void)
+       goto errout;
+     }
+ 
++  /* Cache the complete SoftAP defaults before accepting WEXT updates.
++   * AP_START is delivered asynchronously, so relying on its event handler
++   * leaves a window where an ESSID update copies the zero-initialized cache
++   * back to the Wi-Fi driver (including max_connection and beacon fields).
++   */
++
++  ret = esp_wifi_get_config(WIFI_IF_AP, &g_softap_wifi_cfg);
++  if (ret)
++    {
++      wlerr("Failed to get Wi-Fi SoftAP config ret=%d\n", ret);
++      ret = wifi_errno_trans(ret);
++      goto errout;
++    }
++
+   g_softap_started = true;
+ 
+   wlinfo("OK to start Wi-Fi SoftAP\n");
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wlan.c b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+index b66c95db1f1..a78783b27df 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wlan.c
++++ b/arch/xtensa/src/esp32s3/esp32s3_wlan.c
+@@ -519,20 +519,13 @@ static struct wlan_pktbuf *wlan_txframe(struct wlan_priv_s *priv)
+ 
+ static void wlan_transmit(struct wlan_priv_s *priv)
+ {
+-  static unsigned long submit_seq;
+   static bool tx_nomem_active;
+   struct wlan_pktbuf *pktbuf;
+   int ret;
+ 
+   while ((pktbuf = wlan_txframe(priv)))
+     {
+-      unsigned long seq = ++submit_seq;
+-
+-      printf("[wlan-tx] submit #%lu data=%p len=%u\n",
+-             seq, pktbuf->buffer, pktbuf->len);
+       ret = priv->ops->send(pktbuf->buffer, pktbuf->len);
+-      printf("[wlan-tx] return #%lu data=%p len=%u ret=%d\n",
+-             seq, pktbuf->buffer, pktbuf->len, ret);
+       if (ret == -ENOMEM && !tx_nomem_active)
+         {
+           struct mallinfo info = kmm_mallinfo();
+@@ -549,6 +542,7 @@ static void wlan_transmit(struct wlan_priv_s *priv)
+           printf("[wlan-tx] recovered heap free=%u largest=%u used=%u\n",
+                  info.fordblks, info.mxordblk, info.uordblks);
+         }
++
+       if (ret == -ENOMEM)
+         {
+           wlan_add_txpkt_head(priv, pktbuf);
+@@ -564,6 +558,16 @@ static void wlan_transmit(struct wlan_priv_s *priv)
+             }
+ 
+           wlan_free_buffer(priv, pktbuf->buffer);
++
++          /* The Wi-Fi driver reports completion asynchronously.  Submit
++           * one frame at a time and let wlan_tx_done() schedule the next
++           * one instead of filling the vendor TX queue in a tight loop.
++           */
++
++          if (ret >= 0)
++            {
++              break;
++            }
+         }
+     }
+ }
+@@ -1577,11 +1581,11 @@ static int wlan_sta_rx_done(void *buffer, uint16_t len, void *eb)
+ 
+ static void wlan_sta_tx_done(uint8_t *data, uint16_t *len, bool status)
+ {
+-  static unsigned long done_seq;
+   struct wlan_priv_s *priv = &g_wlan_priv[ESP32S3_WLAN_STA_DEVNO];
+ 
+-  printf("[wlan-tx] done #%lu data=%p len=%u status=%d\n",
+-         ++done_seq, data, len ? *len : 0, status ? 1 : 0);
++  UNUSED(data);
++  UNUSED(len);
++  UNUSED(status);
+   wlan_tx_done(priv);
+ }
+ #endif /* ESP32S3_WLAN_HAS_STA */
+@@ -1633,6 +1637,12 @@ static void wlan_softap_tx_done(uint8_t *data, uint16_t *len, bool status)
+ {
+   struct wlan_priv_s *priv = &g_wlan_priv[ESP32S3_WLAN_SOFTAP_DEVNO];
+ 
++  if (!status)
++    {
++      printf("[wlan-ap-tx] failed data=%p len=%u\n",
++             data, len ? *len : 0);
++    }
++
+   wlan_tx_done(priv);
+ }
+ #endif /* ESP32S3_WLAN_HAS_SOFTAP */
+@@ -1733,6 +1743,39 @@ int esp32s3_wlan_sta_initialize(void)
+ }
+ #endif /* ESP32S3_WLAN_HAS_STA */
+ 
++/****************************************************************************
++ * Name: esp32s3_wlan_softap_set_linkstatus
++ *
++ * Description:
++ *   Set Wi-Fi SoftAP link status.
++ *
++ * Parameters:
++ *   linkstatus - true Notifies the networking layer about an available
++ *                carrier, false Notifies the networking layer about an
++ *                disappeared carrier.
++ *
++ * Returned Value:
++ *   OK on success; Negated errno on failure.
++ *
++ ****************************************************************************/
++
++#ifdef ESP32S3_WLAN_HAS_SOFTAP
++int esp32s3_wlan_softap_set_linkstatus(bool linkstatus)
++{
++  struct wlan_priv_s *priv = &g_wlan_priv[ESP32S3_WLAN_SOFTAP_DEVNO];
++
++  if (linkstatus)
++    {
++      netdev_carrier_on(&priv->dev);
++    }
++  else
++    {
++      netdev_carrier_off(&priv->dev);
++    }
++
++  return OK;
++}
++
+ /****************************************************************************
+  * Name: esp32s3_wlan_softap_initialize
+  *
+@@ -1747,7 +1790,6 @@ int esp32s3_wlan_sta_initialize(void)
+  *
+  ****************************************************************************/
+ 
+-#ifdef ESP32S3_WLAN_HAS_SOFTAP
+ int esp32s3_wlan_softap_initialize(void)
+ {
+   int ret;
+diff --git a/arch/xtensa/src/esp32s3/esp32s3_wlan.h b/arch/xtensa/src/esp32s3/esp32s3_wlan.h
+index a522a602e59..84fb44a4cc4 100644
+--- a/arch/xtensa/src/esp32s3/esp32s3_wlan.h
++++ b/arch/xtensa/src/esp32s3/esp32s3_wlan.h
+@@ -98,6 +98,7 @@ int esp32s3_wlan_sta_initialize(void);
+  ****************************************************************************/
+ 
+ #ifdef ESP32S3_WLAN_HAS_SOFTAP
++int esp32s3_wlan_softap_set_linkstatus(bool linkstatus);
+ int esp32s3_wlan_softap_initialize(void);
+ #endif /* ESP32S3_WLAN_HAS_SOFTAP */
+ 
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+index 3246c0d9e0f..af04145f775 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
++++ b/boards/xtensa/esp32s3/esp32s3-eye/configs/blindbadge/defconfig
+@@ -17,8 +17,10 @@
+ # CONFIG_NDEBUG is not set
+ # CONFIG_NSH_ARGCAT is not set
+ # CONFIG_NSH_CMDOPT_HEXDUMP is not set
++# CONFIG_NSH_NETINIT is not set
+ CONFIG_AI_AGENT_TLS_CONN_POOL_SIZE=1
+ CONFIG_ALLOW_BSD_COMPONENTS=y
++CONFIG_ALLOW_GPL_COMPONENTS=y
+ CONFIG_ARCH="xtensa"
+ CONFIG_ARCH_BOARD="esp32s3-eye"
+ CONFIG_ARCH_BOARD_COMMON=y
+@@ -46,9 +48,12 @@ CONFIG_DEBUG_I2S=y
+ CONFIG_DEFAULT_TASK_STACKSIZE=4096
+ CONFIG_DRIVERS_AUDIO=y
+ CONFIG_DRIVERS_IEEE80211=y
+-CONFIG_DRIVERS_VIDEO=y
+ CONFIG_DRIVERS_WIRELESS=y
++CONFIG_ESP32S3_CAM=y
+ CONFIG_ESP32S3_EYE_LCD=y
++CONFIG_ESP32S3_I2C0=y
++CONFIG_ESP32S3_I2C0_SCLPIN=5
++CONFIG_ESP32S3_I2C0_SDAPIN=4
+ CONFIG_ESP32S3_I2S0=y
+ CONFIG_ESP32S3_I2S0_BCLKPIN=41
+ CONFIG_ESP32S3_I2S0_DATA_BIT_WIDTH_32BIT=y
+@@ -56,6 +61,10 @@ CONFIG_ESP32S3_I2S0_DINPIN=2
+ CONFIG_ESP32S3_I2S0_SAMPLE_RATE=16000
+ CONFIG_ESP32S3_I2S0_WSPIN=42
+ CONFIG_ESP32S3_I2S=y
++CONFIG_ESP32S3_LEDC=y
++CONFIG_ESP32S3_LEDC_CHANNEL0_PIN=15
++CONFIG_ESP32S3_LEDC_TIM0=y
++CONFIG_ESP32S3_LEDC_TIM0_CHANNELS=1
+ CONFIG_ESP32S3_RT_TIMER_TASK_STACK_SIZE=4096
+ CONFIG_ESP32S3_SPI2_CLKPIN=21
+ CONFIG_ESP32S3_SPI2_CSPIN=44
+@@ -65,11 +74,13 @@ CONFIG_ESP32S3_SPIRAM=y
+ CONFIG_ESP32S3_SPIRAM_MODE_OCT=y
+ CONFIG_ESP32S3_USBSERIAL=y
+ CONFIG_ESP32S3_WIFI=y
++CONFIG_ESP32S3_WIFI_SOFTAP=y
+ CONFIG_ESPRESSIF_SILENT_BOOT=y
+ CONFIG_ETC_ROMFS=y
+ CONFIG_EXAMPLES_AI_AGENT_VELA=y
+ CONFIG_EXAMPLES_AI_AGENT_VELA_NODE_DISPLAY_NAME="BlindBadge ESP32-S3-EYE"
+ CONFIG_EXAMPLES_AI_AGENT_VELA_NODE_ID="blind-badge-esp32s3"
++CONFIG_EXAMPLES_DHCPD=y
+ CONFIG_EXAMPLES_RANDOM=y
+ CONFIG_FS_PROCFS=y
+ CONFIG_FS_ROMFS=y
+@@ -99,6 +110,9 @@ CONFIG_NETDEV_LATEINIT=y
+ CONFIG_NETDEV_PHY_IOCTL=y
+ CONFIG_NETDEV_WIRELESS_IOCTL=y
+ CONFIG_NETUTILS_CJSON=y
++CONFIG_NETUTILS_DHCPD=y
++CONFIG_NETUTILS_DHCPD_ROUTERIP=0xc0a80401
++CONFIG_NETUTILS_DHCPD_STARTIP=0xc0a80402
+ CONFIG_NETUTILS_IPERF=y
+ CONFIG_NET_BROADCAST=y
+ CONFIG_NET_ETH_PKTSIZE=1514
+@@ -116,6 +130,10 @@ CONFIG_NSH_FILEIOSIZE=512
+ CONFIG_NSH_LINELEN=255
+ CONFIG_NSH_READLINE=y
+ CONFIG_OPENSSL_MBEDTLS_WRAPPER=y
++CONFIG_OV2640_FREQUENCY=100000
++CONFIG_OV2640_I2CADDR=0x30
++CONFIG_OV2640_JPEG=y
++CONFIG_OV2640_JPEG_VGA_RESOLUTION=y
+ CONFIG_POSIX_SPAWN_DEFAULT_STACKSIZE=2048
+ CONFIG_PREALLOC_TIMERS=4
+ CONFIG_PTHREAD_MUTEX_TYPES=y
+@@ -137,6 +155,8 @@ CONFIG_TIMER=y
+ CONFIG_TLS_TASK_NELEM=4
+ CONFIG_VIDEO=y
+ CONFIG_VIDEO_FB=y
++CONFIG_VIDEO_OV2640=y
++CONFIG_VIDEO_STREAM=y
+ CONFIG_WIRELESS=y
+ CONFIG_WIRELESS_WAPI=y
+ CONFIG_WIRELESS_WAPI_CMDTOOL=y
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+index f18f80cb978..b54dc137ff2 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_board_camera.c
+@@ -16,6 +16,7 @@
+ 
+ #include <errno.h>
+ #include <stddef.h>
++#include <stdio.h>
+ #include <stdint.h>
+ #include <string.h>
+ #include <syslog.h>
+@@ -25,6 +26,7 @@
+ #include <nuttx/timers/pwm.h>
+ #include <nuttx/video/imgdata.h>
+ #include <nuttx/video/imgsensor.h>
++#include <nuttx/video/ov2640.h>
+ #include <nuttx/video/v4l2_cap.h>
+ #include <sys/videoio.h>
+ 
+@@ -42,9 +44,8 @@
+ #define OV2640_I2C_BUS 0
+ #define OV2640_I2C_FREQ 100000
+ 
+-#define QVGA_WIDTH 320
+-#define QVGA_HEIGHT 240
+-#define RGB565_BPP 2
++#define VGA_WIDTH 640
++#define VGA_HEIGHT 480
+ 
+ /****************************************************************************
+  * Private Types
+@@ -243,27 +244,27 @@ static const struct v4l2_fmtdesc g_fmtdesc = {
+     .index = 0,
+     .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+     .flags = 0,
+-    .description = "RGB565",
+-    .pixelformat = V4L2_PIX_FMT_RGB565,
++    .description = "JPEG",
++    .pixelformat = V4L2_PIX_FMT_JPEG,
+ };
+ 
+ static const struct v4l2_frmsizeenum g_frmsize = {
+     .index = 0,
+     .buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+-    .pixel_format = V4L2_PIX_FMT_RGB565,
++    .pixel_format = V4L2_PIX_FMT_JPEG,
+     .type = V4L2_FRMSIZE_TYPE_DISCRETE,
+     .discrete = {
+-        .width = QVGA_WIDTH,
+-        .height = QVGA_HEIGHT,
++        .width = VGA_WIDTH,
++        .height = VGA_HEIGHT,
+     },
+ };
+ 
+ static const struct v4l2_frmivalenum g_frminterval = {
+     .index = 0,
+     .buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+-    .pixel_format = V4L2_PIX_FMT_RGB565,
+-    .width = QVGA_WIDTH,
+-    .height = QVGA_HEIGHT,
++    .pixel_format = V4L2_PIX_FMT_JPEG,
++    .width = VGA_WIDTH,
++    .height = VGA_HEIGHT,
+     .type = V4L2_FRMIVAL_TYPE_DISCRETE,
+     .discrete = {
+         .numerator = 1,
+@@ -390,36 +391,59 @@ static void ov2640_start_xclk(void)
+ {
+     FAR struct pwm_lowerhalf_s *pwm;
+     struct pwm_info_s info;
++    int ret;
+ 
+     pwm = esp32s3_ledc_init(0);
+     if (pwm == NULL) {
+         syslog(LOG_ERR, "CAM: LEDC init failed\n");
++        printf("CAM: LEDC init failed\n");
+         return;
+     }
+ 
+-    pwm->ops->setup(pwm);
++    ret = pwm->ops->setup(pwm);
++    printf("CAM: XCLK setup ret=%d\n", ret);
+ 
+     info.frequency = 20000000;
+     info.duty = (ub16_t)(65536 / 2);
+ 
+-    pwm->ops->start(pwm, &info);
++    ret = pwm->ops->start(pwm, &info);
++    printf("CAM: XCLK start ret=%d frequency=%lu pin=%d\n",
++           ret, (unsigned long)info.frequency,
++           CONFIG_ESP32S3_LEDC_CHANNEL0_PIN);
+     syslog(LOG_INFO, "CAM: LEDC XCLK 20MHz started on GPIO15\n");
+ }
+ 
+-static int ov2640_init(FAR struct imgsensor_s* sensor)
++static int ov2640_init(FAR struct imgsensor_s *sensor)
+ {
+     FAR struct i2c_master_s* i2c;
+     int ret;
+ 
++    printf("CAM: OV2640 init begin\n");
+     ov2640_start_xclk();
+     syslog(LOG_INFO, "CAM: LEDC XCLK started on GPIO15\n");
+     up_mdelay(50);
+ 
+     i2c = esp32s3_i2cbus_initialize(OV2640_I2C_BUS);
++    printf("CAM: I2C%d initialize -> %p\n", OV2640_I2C_BUS, i2c);
+     if (i2c == NULL) {
++        syslog(LOG_ERR, "CAM: I2C%d initialization failed\n",
++            OV2640_I2C_BUS);
+         return -ENODEV;
+     }
+ 
++#ifdef CONFIG_OV2640_JPEG
++    ret = ov2640_initialize(i2c);
++    printf("CAM: ov2640_initialize ret=%d\n", ret);
++    if (ret < 0)
++      {
++        syslog(LOG_ERR, "CAM: ov2640_initialize failed: %d\n", ret);
++        return ret;
++      }
++
++    syslog(LOG_INFO, "OV2640 sensor configured for VGA JPEG\n");
++    return OK;
++#else
++
+     /* 1. Soft reset */
+ 
+     ret = WRITE_REGS(i2c, g_ov2640_reset);
+@@ -475,6 +499,7 @@ static int ov2640_init(FAR struct imgsensor_s* sensor)
+ 
+     syslog(LOG_INFO, "OV2640 sensor configured for QVGA RGB565\n");
+     return OK;
++#endif
+ }
+ 
+ static int ov2640_uninit(FAR struct imgsensor_s* sensor)
+@@ -488,12 +513,20 @@ static FAR const char* ov2640_get_driver_name(
+     return "OV2640";
+ }
+ 
+-static int ov2640_validate(FAR struct imgsensor_s* sensor,
++static int ov2640_validate(FAR struct imgsensor_s *sensor,
+     imgsensor_stream_type_t type,
+     uint8_t nr_datafmts,
+-    FAR imgsensor_format_t* datafmts,
+-    FAR imgsensor_interval_t* interval)
++    FAR imgsensor_format_t *datafmts,
++    FAR imgsensor_interval_t *interval)
+ {
++    if (nr_datafmts != 1 || datafmts == NULL ||
++        datafmts[0].pixelformat != IMGSENSOR_PIX_FMT_JPEG ||
++        datafmts[0].width != VGA_WIDTH ||
++        datafmts[0].height != VGA_HEIGHT)
++      {
++        return -EINVAL;
++      }
++
+     return OK;
+ }
+ 
+diff --git a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_boot.c b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_boot.c
+index 6ea239fef81..86f4e3dae95 100644
+--- a/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_boot.c
++++ b/boards/xtensa/esp32s3/esp32s3-eye/src/esp32s3_boot.c
+@@ -85,6 +85,7 @@ static void esp32s3_start_blindbadge_task(FAR const char *name,
+                                           FAR char *argv[])
+ {
+   /* Start board services before NSH touches the USB console. */
++
+   task_create(name, priority, 16384,
+               blind_badge_app_main, argv);
+ }
+@@ -97,23 +98,18 @@ void board_late_initialize(void)
+   esp32s3_bringup();
+ 
+ #ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_024_BLIND_BADGE_APP
+-  FAR char *wifi_argv[] =
+-    {
+-      "boot_display", NULL
+-    };
+-  FAR char *uart_argv[] =
++  FAR char *vision_argv[] =
+     {
+-      "uart_link_start", NULL
++      "vision_server", "80", NULL
+     };
++
+   FAR char *button_argv[] =
+     {
+       "button_service", NULL
+     };
+ 
+-  esp32s3_start_blindbadge_task("bb_wifi", SCHED_PRIORITY_DEFAULT + 2,
+-                                wifi_argv);
+-  esp32s3_start_blindbadge_task("bb_uart", SCHED_PRIORITY_DEFAULT,
+-                                uart_argv);
++  esp32s3_start_blindbadge_task("bb_vision", SCHED_PRIORITY_DEFAULT + 2,
++                                vision_argv);
+   esp32s3_start_blindbadge_task("bb_button", SCHED_PRIORITY_DEFAULT + 1,
+                                 button_argv);
+ #endif
+diff --git a/drivers/video/ov2640.c b/drivers/video/ov2640.c
+index ec071517082..646b0d4152e 100644
+--- a/drivers/video/ov2640.c
++++ b/drivers/video/ov2640.c
+@@ -29,6 +29,7 @@
+ #include <sys/types.h>
+ #include <string.h>
+ #include <errno.h>
++#include <stdio.h>
+ #include <debug.h>
+ 
+ #include <nuttx/arch.h>
+@@ -1439,8 +1440,12 @@ static int ovr2640_chipid(FAR struct i2c_master_s *i2c)
+       return ret;
+     }
+ 
+-  pidl = ov2640_getreg(i2c, 0x0a);      /* Product ID (MS) */
+-  pidh = ov2640_getreg(i2c, 0x0b);      /* Product ID (LS) */
++  pidh = ov2640_getreg(i2c, 0x0a);      /* Product ID (MS) */
++  pidl = ov2640_getreg(i2c, 0x0b);      /* Product ID (LS) */
++
++  printf("CAM: OV2640 PID registers 0x0a=0x%02x 0x0b=0x%02x "
++         "expected 0x%02x 0x%02x\n",
++         pidh, pidl, OVR2640_PRODUCT_IDH, OVR2640_PRODUCT_IDL);
+ 
+ #ifdef CONFIG_DEBUG_GRAPHICS
+   midh = ov2640_getreg(i2c, 0x1c); /* Manufacturer ID (high) = 0x7f */
+diff --git a/drivers/video/v4l2_cap.c b/drivers/video/v4l2_cap.c
+index 4b14c53c4fa..97988d2e340 100644
+--- a/drivers/video/v4l2_cap.c
++++ b/drivers/video/v4l2_cap.c
+@@ -2012,8 +2012,6 @@ static int complete_capture(uint8_t err_code,
+       return -EINVAL;
+     }
+ 
+-  poll_notify(&type_inf->fds, 1, POLLIN);
+-
+   if (err_code == 0)
+     {
+       type_inf->bufinf.vbuf_next->buf.flags = 0;
+@@ -2092,6 +2090,13 @@ static int complete_capture(uint8_t err_code,
+     }
+ 
+   spin_unlock_irqrestore_nopreempt(&cmng->lock, flags);
++
++  /* Wake poll waiters only after the completed buffer is published and the
++   * capture lock is released.  A higher-priority waiter may run immediately
++   * from poll_notify() and enter DQBUF.
++   */
++
++  poll_notify(&type_inf->fds, 1, POLLIN);
+   return OK;
+ }
+ 
+@@ -3614,6 +3619,7 @@ static int capture_open(FAR struct file *filep)
+       /* Only in first execution, open device */
+ 
+       ret = IMGSENSOR_INIT(cmng->imgsensor);
++      printf("CAM: IMGSENSOR_INIT ret=%d\n", ret);
+       if (ret == OK)
+         {
+           ret = IMGDATA_INIT(cmng->imgdata);
+-- 
+2.25.1
+

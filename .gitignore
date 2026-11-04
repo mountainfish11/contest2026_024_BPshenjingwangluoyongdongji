@@ -24,3 +24,6 @@ ai_agent_local_secrets.h
 
 # Local reference material that is not part of the contest submission package
 /asr_pro_e.pdf
+
+# Generated intermediate frames; final PDF/MP4 in submission/ are kept
+/submission/frames/
