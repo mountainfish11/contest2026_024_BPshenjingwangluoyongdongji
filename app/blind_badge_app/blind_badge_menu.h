@@ -27,6 +27,12 @@ enum blind_badge_menu_id blind_badge_menu_selected(void);
 int blind_badge_menu_enter(void);
 int blind_badge_menu_leave(void);
 
+/* Ask the button/menu thread to leave the current service on its next refresh.
+ * This keeps display and service teardown out of the UART callback thread.
+ */
+
+void blind_badge_menu_request_leave(void);
+
 /* Redraw the service page only when its state or detail line changed.
  * No-op while the menu list is visible.
  */

@@ -32,6 +32,7 @@
 #define BLIND_BADGE_TEST_PRIORITY 100
 #define BLIND_BADGE_TEST_REPLY_SIZE 256
 #define BLIND_BADGE_TEST_DETAIL_SIZE 40
+#define BLIND_BADGE_HEALTH_DETAIL_SIZE 40
 
 static const char *const g_service_labels[] =
 {
@@ -53,6 +54,8 @@ static pthread_t g_vision_thread;
 static bool g_vision_cancel_requested;
 static int g_vision_result;
 static int g_alert_result;
+static int g_health_result;
+static char g_health_detail[BLIND_BADGE_HEALTH_DETAIL_SIZE];
 static pthread_cond_t g_voice_cond = PTHREAD_COND_INITIALIZER;
 static bool g_voice_task_active;
 static bool g_voice_thread_joinable;
@@ -166,6 +169,27 @@ static int alert_service_start(void)
 
   if (UART_LINK_SendFlag("EMERGENCY_SEND") != 0)
     {
+      return -EIO;
+    }
+
+  return 0;
+}
+
+static int health_service_start(void)
+{
+  if (!UART_LINK_IsConnected())
+    {
+      strlcpy(g_health_detail, "sub-board offline",
+              sizeof(g_health_detail));
+      return -ENOTCONN;
+    }
+
+  strlcpy(g_health_detail, "place finger on sensor",
+          sizeof(g_health_detail));
+  if (UART_LINK_SendFlag("HEALTH_START") != 0)
+    {
+      strlcpy(g_health_detail, "start command failed",
+              sizeof(g_health_detail));
       return -EIO;
     }
 
@@ -553,6 +577,19 @@ int blind_badge_service_start(enum blind_badge_menu_id id)
 
       g_service_state = BLIND_BADGE_SERVICE_RUNNING;
     }
+  else if (id == BLIND_BADGE_MENU_HEALTH)
+    {
+      g_service_state = BLIND_BADGE_SERVICE_STARTING;
+      g_health_result = health_service_start();
+      if (g_health_result < 0)
+        {
+          g_service_state = BLIND_BADGE_SERVICE_ERROR;
+          pthread_mutex_unlock(&g_service_lock);
+          return g_health_result;
+        }
+
+      g_service_state = BLIND_BADGE_SERVICE_RUNNING;
+    }
   else if (id == BLIND_BADGE_MENU_ALERT)
     {
       g_service_state = BLIND_BADGE_SERVICE_STARTING;
@@ -678,6 +715,10 @@ int blind_badge_service_stop(void)
 
       blind_badge_ai_reset_aborted();
     }
+  else if (active == BLIND_BADGE_MENU_HEALTH)
+    {
+      (void)UART_LINK_SendFlag("HEALTH_STOP");
+    }
   else if (active == BLIND_BADGE_MENU_TEST)
     {
       int retries;
@@ -727,6 +768,11 @@ int blind_badge_service_stop(void)
       g_test_task_pid = -1;
       g_test_cancel_requested = false;
       strlcpy(g_test_detail, "idle", sizeof(g_test_detail));
+    }
+  else if (active == BLIND_BADGE_MENU_HEALTH)
+    {
+      g_health_result = 0;
+      strlcpy(g_health_detail, "idle", sizeof(g_health_detail));
     }
 
   g_service_state = BLIND_BADGE_SERVICE_IDLE;
@@ -781,6 +827,33 @@ void blind_badge_service_voice_idle(void)
     }
 
   pthread_mutex_unlock(&g_service_lock);
+}
+
+int blind_badge_service_health_done(int heart_rate_bpm)
+{
+  int ret = -EACCES;
+
+  pthread_mutex_lock(&g_service_lock);
+  if (g_service_active == BLIND_BADGE_MENU_HEALTH &&
+      g_service_state == BLIND_BADGE_SERVICE_RUNNING)
+    {
+      g_health_result = heart_rate_bpm > 0 ? 0 : -ENODATA;
+      if (heart_rate_bpm > 0)
+        {
+          snprintf(g_health_detail, sizeof(g_health_detail),
+                   "heart rate %d BPM", heart_rate_bpm);
+        }
+      else
+        {
+          strlcpy(g_health_detail, "sensor unavailable",
+                  sizeof(g_health_detail));
+        }
+
+      ret = 0;
+    }
+
+  pthread_mutex_unlock(&g_service_lock);
+  return ret;
 }
 
 enum blind_badge_service_state blind_badge_service_state(void)
@@ -854,8 +927,10 @@ int blind_badge_service_detail(char *buf, size_t size)
   struct blind_badge_vision_server_snapshot snapshot;
   int vision_result;
   int alert_result;
+  int health_result;
   int test_result;
   char voice_detail[BLIND_BADGE_VOICE_DETAIL_SIZE];
+  char health_detail[BLIND_BADGE_HEALTH_DETAIL_SIZE];
   char test_detail[BLIND_BADGE_TEST_DETAIL_SIZE];
 
   if (buf == NULL || size == 0)
@@ -867,8 +942,10 @@ int blind_badge_service_detail(char *buf, size_t size)
   active = g_service_active;
   vision_result = g_vision_result;
   alert_result = g_alert_result;
+  health_result = g_health_result;
   test_result = g_test_result;
   strlcpy(voice_detail, g_voice_detail, sizeof(voice_detail));
+  strlcpy(health_detail, g_health_detail, sizeof(health_detail));
   strlcpy(test_detail, g_test_detail, sizeof(test_detail));
   pthread_mutex_unlock(&g_service_lock);
 
@@ -913,6 +990,20 @@ int blind_badge_service_detail(char *buf, size_t size)
       else
         {
           snprintf(buf, size, "alert requested");
+        }
+
+      return 0;
+    }
+
+  if (active == BLIND_BADGE_MENU_HEALTH)
+    {
+      if (health_detail[0] != '\0')
+        {
+          snprintf(buf, size, "%s", health_detail);
+        }
+      else
+        {
+          snprintf(buf, size, "health monitor: %d", health_result);
         }
 
       return 0;

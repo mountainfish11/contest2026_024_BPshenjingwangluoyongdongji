@@ -17,7 +17,8 @@ enum uart_link_event_type
   UART_LINK_EVENT_STEP_DOWN,
   UART_LINK_EVENT_EMERGENCY,
   UART_LINK_EVENT_ASR_RESULT,
-  UART_LINK_EVENT_VOICE_IDLE
+  UART_LINK_EVENT_VOICE_IDLE,
+  UART_LINK_EVENT_HEALTH_DONE
 };
 
 struct uart_link_event
@@ -28,6 +29,7 @@ struct uart_link_event
   char direction[16];
   char source[16];
   char text[96];
+  int heart_rate_bpm;
 };
 
 typedef void (*uart_link_event_handler_t)(const struct uart_link_event *event,

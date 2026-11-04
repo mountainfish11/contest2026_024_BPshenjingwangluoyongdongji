@@ -1200,6 +1200,14 @@ static void handle_uart_link_event(const struct uart_link_event *link_event,
         blind_badge_service_voice_idle();
         return;
 
+      case UART_LINK_EVENT_HEALTH_DONE:
+        if (blind_badge_service_health_done(link_event->heart_rate_bpm) == 0)
+          {
+            blind_badge_menu_request_leave();
+          }
+
+        return;
+
       default:
         return;
     }

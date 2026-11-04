@@ -41,6 +41,10 @@ int blind_badge_service_submit_asr(const char *text);
 
 void blind_badge_service_voice_idle(void);
 
+/* Complete HEALTH after the sub-board has spoken the measured result. */
+
+int blind_badge_service_health_done(int heart_rate_bpm);
+
 /* Effective state, derived from the service task itself. */
 
 enum blind_badge_service_state blind_badge_service_state(void);

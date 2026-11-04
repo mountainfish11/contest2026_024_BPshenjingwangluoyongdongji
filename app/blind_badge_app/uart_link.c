@@ -487,6 +487,16 @@ static int handle_line(const char *line)
           return 0;
         }
     }
+  else if (strcmp(type, "HEALTH_DONE") == 0)
+    {
+      event.type = UART_LINK_EVENT_HEALTH_DONE;
+      parsed = sscanf(payload, "%d", &event.heart_rate_bpm);
+      if (parsed != 1 || event.heart_rate_bpm < 0 ||
+          event.heart_rate_bpm > 250)
+        {
+          return 0;
+        }
+    }
   else
     {
       return 0;

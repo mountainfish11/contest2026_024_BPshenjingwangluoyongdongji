@@ -27,6 +27,7 @@ enum blind_badge_speech_mode
   BLIND_BADGE_SPEECH_MODE_MENU = 0,
   BLIND_BADGE_SPEECH_MODE_VISION,
   BLIND_BADGE_SPEECH_MODE_VOICE,
+  BLIND_BADGE_SPEECH_MODE_HEALTH,
   BLIND_BADGE_SPEECH_MODE_ALERT,
   BLIND_BADGE_SPEECH_MODE_SILENT
 };
@@ -75,6 +76,7 @@ static const struct blind_badge_menu_item g_menu_items[] =
 static size_t g_menu_selected;
 static enum blind_badge_menu_page g_menu_page;
 static bool g_menu_redraw_pending;
+static volatile bool g_menu_leave_requested;
 static bool g_speech_link_was_connected;
 static int g_speech_mode_sent = -1;
 static char g_menu_cached_state[BLIND_BADGE_MENU_STATE_SIZE];
@@ -99,6 +101,7 @@ static int menu_sync_speech_mode(enum blind_badge_speech_mode mode)
     "SPEECH_MODE_MENU",
     "SPEECH_MODE_VISION",
     "SPEECH_MODE_VOICE",
+    "SPEECH_MODE_HEALTH",
     "SPEECH_MODE_ALERT",
     "SPEECH_MODE_SILENT"
   };
@@ -179,6 +182,7 @@ static int render_service_page(void)
   (void)menu_sync_speech_mode(
     id == BLIND_BADGE_MENU_VISION ? BLIND_BADGE_SPEECH_MODE_VISION :
     id == BLIND_BADGE_MENU_VOICE ? BLIND_BADGE_SPEECH_MODE_VOICE :
+    id == BLIND_BADGE_MENU_HEALTH ? BLIND_BADGE_SPEECH_MODE_HEALTH :
     id == BLIND_BADGE_MENU_ALERT ? BLIND_BADGE_SPEECH_MODE_ALERT :
     BLIND_BADGE_SPEECH_MODE_SILENT);
 
@@ -211,6 +215,7 @@ int blind_badge_menu_show(void)
 
   menu_build_arrays(labels, icons);
   g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
+  g_menu_leave_requested = false;
   g_menu_redraw_pending = false;
 
   ret = blind_badge_display_show_menu(labels, icons,
@@ -283,6 +288,7 @@ int blind_badge_menu_enter(void)
   (void)menu_sync_speech_mode(
     selected == BLIND_BADGE_MENU_VISION ? BLIND_BADGE_SPEECH_MODE_VISION :
     selected == BLIND_BADGE_MENU_VOICE ? BLIND_BADGE_SPEECH_MODE_VOICE :
+    selected == BLIND_BADGE_MENU_HEALTH ? BLIND_BADGE_SPEECH_MODE_HEALTH :
     selected == BLIND_BADGE_MENU_ALERT ? BLIND_BADGE_SPEECH_MODE_ALERT :
     BLIND_BADGE_SPEECH_MODE_SILENT);
 
@@ -317,8 +323,20 @@ int blind_badge_menu_leave(void)
   return blind_badge_menu_show();
 }
 
+void blind_badge_menu_request_leave(void)
+{
+  g_menu_leave_requested = true;
+}
+
 int blind_badge_menu_refresh(void)
 {
+  if (g_menu_page == BLIND_BADGE_MENU_PAGE_SERVICE &&
+      g_menu_leave_requested)
+    {
+      g_menu_leave_requested = false;
+      return blind_badge_menu_leave();
+    }
+
   if (g_menu_page != BLIND_BADGE_MENU_PAGE_SERVICE)
     {
       if (g_menu_redraw_pending &&
