@@ -760,8 +760,27 @@ int UART_LINK_Wait(void)
 
 int UART_LINK_Stop(void)
 {
+  int client_fd;
+
   if (!g_running) return 0;
   g_running = 0;
+
+  /* The link thread can be asleep in select() for up to one second.  A
+   * VOICE request intentionally stops this local TCP service before opening
+   * the cloud TLS connection, so waiting for that timeout adds a fixed one
+   * second to every conversation turn.  Shutting down the connected peer
+   * wakes select() immediately; the link thread remains the sole owner that
+   * closes the descriptor during its normal exit path.
+   */
+
+  pthread_mutex_lock(&g_client_lock);
+  client_fd = g_client_fd;
+  if (client_fd >= 0)
+    {
+      shutdown(client_fd, SHUT_RDWR);
+    }
+  pthread_mutex_unlock(&g_client_lock);
+
   pthread_join(g_thread, NULL);
   return 0;
 }

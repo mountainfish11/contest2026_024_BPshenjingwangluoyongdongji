@@ -64,6 +64,9 @@ static unsigned int g_voice_generation;
 static int g_voice_result;
 static char g_voice_text[BLIND_BADGE_VOICE_TEXT_SIZE];
 static char g_voice_detail[BLIND_BADGE_VOICE_DETAIL_SIZE];
+static long g_voice_cut_ms;
+static long g_voice_ai_ms;
+static long g_voice_link_ms;
 static bool g_test_task_active;
 static bool g_test_cancel_requested;
 static pid_t g_test_task_pid = -1;
@@ -242,10 +245,21 @@ static int voice_resume_listening(unsigned int generation)
   return -EIO;
 }
 
+static long voice_elapsed_ms(const struct timespec *start,
+                             const struct timespec *end)
+{
+  return (end->tv_sec - start->tv_sec) * 1000L +
+         (end->tv_nsec - start->tv_nsec) / 1000000L;
+}
+
 static void *voice_service_worker(void *arg)
 {
   char recognized[BLIND_BADGE_VOICE_TEXT_SIZE];
   char response[BLIND_BADGE_VOICE_REPLY_SIZE];
+  struct timespec cut_started;
+  struct timespec ai_started;
+  struct timespec ai_finished;
+  struct timespec reply_finished;
   unsigned int generation;
   int used_fallback;
   int link_ret;
@@ -284,13 +298,16 @@ static void *voice_service_worker(void *arg)
        * before the reply is delivered.
        */
 
+      clock_gettime(CLOCK_MONOTONIC, &cut_started);
       (void)UART_LINK_Stop();
+      clock_gettime(CLOCK_MONOTONIC, &ai_started);
       memset(response, 0, sizeof(response));
       used_fallback = 0;
       ret = blind_badge_ask_ai(
               BLIND_BADGE_AI_DIRECT, recognized,
               "我听到了，请再说一遍需要我帮什么。",
               response, sizeof(response), &used_fallback);
+      clock_gettime(CLOCK_MONOTONIC, &ai_finished);
       link_ret = UART_LINK_Start();
       if (ret == 0 && link_ret != 0)
         {
@@ -298,6 +315,9 @@ static void *voice_service_worker(void *arg)
         }
 
       pthread_mutex_lock(&g_service_lock);
+      g_voice_cut_ms = voice_elapsed_ms(&cut_started, &ai_started);
+      g_voice_ai_ms = voice_elapsed_ms(&ai_started, &ai_finished);
+      g_voice_link_ms = 0;
 
       if (g_voice_cancel_requested || generation != g_voice_generation)
         {
@@ -312,7 +332,10 @@ static void *voice_service_worker(void *arg)
 
           pthread_mutex_unlock(&g_service_lock);
           ret = voice_send_reply(response, generation);
+          clock_gettime(CLOCK_MONOTONIC, &reply_finished);
           pthread_mutex_lock(&g_service_lock);
+          g_voice_link_ms = voice_elapsed_ms(&ai_finished,
+                                             &reply_finished);
         }
       else if (used_fallback)
         {
@@ -345,8 +368,9 @@ static void *voice_service_worker(void *arg)
         {
           if (!used_fallback)
             {
-              strlcpy(g_voice_detail, "reply sent",
-                      sizeof(g_voice_detail));
+              snprintf(g_voice_detail, sizeof(g_voice_detail),
+                       "cut %ld AI %ld link %ld",
+                       g_voice_cut_ms, g_voice_ai_ms, g_voice_link_ms);
             }
         }
       else
