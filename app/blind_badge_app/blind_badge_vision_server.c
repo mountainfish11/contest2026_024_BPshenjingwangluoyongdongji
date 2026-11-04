@@ -53,8 +53,9 @@
 #define VISION_STA_RETRY_DELAY_SEC 2
 #define VISION_HTTP_REQUEST_MAX 512
 #define VISION_HTTP_IO_TIMEOUT_MS 1500
-#define VISION_HTTP_SEND_CHUNK 1400
-#define VISION_HTTP_SEND_DELAY_US 1000
+#define VISION_HTTP_POLL_SLICE_MS 100
+#define VISION_STREAM_SEND_TIMEOUT_MS 5000
+#define VISION_HTTP_SEND_CHUNK 12288
 #define VISION_STREAM_STACK_SIZE 8192
 #define VISION_CLIENT_DETACHED 1
 #define VISION_FRAME_TIMEOUT_MS 1500
@@ -138,15 +139,32 @@ static void vision_log_heap(const char *stage)
          stage, info.fordblks, info.mxordblk, info.uordblks);
 }
 
-static int vision_send_all(int fd, const void *data, size_t length)
+static int vision_send_all_timeout(int fd, const void *data, size_t length,
+                                   int timeout_ms)
 {
   const uint8_t *cursor = data;
   struct pollfd pollfd;
+  uint64_t deadline_us;
+  uint64_t now_us;
   size_t sent = 0;
+  int remaining_ms;
   int waitret;
 
+  deadline_us = vision_monotonic_us() +
+                (uint64_t)timeout_ms * 1000;
   while (sent < length)
     {
+      if (g_server_stop)
+        {
+          return -ECANCELED;
+        }
+
+      now_us = vision_monotonic_us();
+      if (now_us >= deadline_us)
+        {
+          return -ETIMEDOUT;
+        }
+
       size_t remaining = length - sent;
       size_t chunk = remaining > VISION_HTTP_SEND_CHUNK ?
                      VISION_HTTP_SEND_CHUNK : remaining;
@@ -168,26 +186,60 @@ static int vision_send_all(int fd, const void *data, size_t length)
               pollfd.fd = fd;
               pollfd.events = POLLOUT;
               pollfd.revents = 0;
-              waitret = poll(&pollfd, 1, VISION_HTTP_IO_TIMEOUT_MS);
+              remaining_ms = (int)((deadline_us - now_us + 999) / 1000);
+              if (remaining_ms > VISION_HTTP_POLL_SLICE_MS)
+                {
+                  remaining_ms = VISION_HTTP_POLL_SLICE_MS;
+                }
+
+              waitret = poll(&pollfd, 1, remaining_ms);
               if (waitret > 0)
+                {
+                  if ((pollfd.revents & POLLOUT) != 0)
+                    {
+                      continue;
+                    }
+
+                  if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                    {
+                      return -EPIPE;
+                    }
+
+                  continue;
+                }
+
+              if (waitret == 0)
                 {
                   continue;
                 }
 
-              return waitret == 0 ? -ETIMEDOUT : -errno;
+              if (errno == EINTR)
+                {
+                  continue;
+                }
+
+              return -errno;
             }
 
           return -errno;
         }
 
       sent += ret;
-      if (sent < length)
-        {
-          usleep(VISION_HTTP_SEND_DELAY_US);
-        }
     }
 
   return OK;
+}
+
+static int vision_send_all(int fd, const void *data, size_t length)
+{
+  return vision_send_all_timeout(fd, data, length,
+                                 VISION_HTTP_IO_TIMEOUT_MS);
+}
+
+static int vision_stream_send_all(int fd, const void *data, size_t length)
+{
+  return vision_send_all_timeout(fd, data, length,
+                                 VISION_STREAM_SEND_TIMEOUT_MS);
 }
 
 static int vision_send_text(int fd, int status, const char *reason,
@@ -751,7 +803,8 @@ static int vision_handle_stream(int fd)
       return -ENOMEM;
     }
 
-  ret = vision_send_all(fd, stream_header, sizeof(stream_header) - 1);
+  ret = vision_stream_send_all(fd, stream_header,
+                               sizeof(stream_header) - 1);
 
   while (ret == OK && !g_server_stop)
     {
@@ -781,15 +834,15 @@ static int vision_handle_stream(int fd)
                         "--frame\r\nContent-Type: image/jpeg\r\n"
                         "Content-Length: %u\r\n\r\n",
                         (unsigned)jpeg_size);
-      ret = vision_send_all(fd, part, length);
+      ret = vision_stream_send_all(fd, part, length);
       if (ret == OK)
         {
-          ret = vision_send_all(fd, jpeg, jpeg_size);
+          ret = vision_stream_send_all(fd, jpeg, jpeg_size);
         }
 
       if (ret == OK)
         {
-          ret = vision_send_all(fd, "\r\n", 2);
+          ret = vision_stream_send_all(fd, "\r\n", 2);
           if (ret == OK)
             {
               vision_count_frame();
@@ -813,8 +866,8 @@ static void *vision_stream_worker(void *arg)
   pthread_mutex_lock(&g_server_lock);
   g_stream_fd = -1;
   g_stream_active = false;
-  if (ret < 0 && ret != -EPIPE && ret != -ECONNRESET &&
-      ret != -ENOTCONN)
+  if (ret < 0 && ret != -ECANCELED && ret != -EPIPE &&
+      ret != -ECONNRESET && ret != -ENOTCONN)
     {
       g_last_error = ret;
     }
