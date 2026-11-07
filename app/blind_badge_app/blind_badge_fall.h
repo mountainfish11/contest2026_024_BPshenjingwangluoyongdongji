@@ -1,9 +1,9 @@
 /****************************************************************************
  * Contest 2026 team 024 - BlindBadge fall detection
  *
- * Detects falls using the QMA7981 accelerometer via a three-phase
- * algorithm: free-fall → impact → stillness.  When a fall is detected,
- * the callback fires so the main app can trigger an emergency event.
+ * Detects a rapid acceleration toward the bottom edge of the LCD using the
+ * QMA7981 accelerometer.  On ESP32-S3-EYE this direction was measured as +X.
+ * The callback posts an emergency preemption request to the main app.
  ****************************************************************************/
 
 #ifndef __BLIND_BADGE_FALL_H
@@ -19,12 +19,12 @@ typedef void (*fall_detect_cb_t)(void *arg);
 
 struct fall_detect_config
 {
-  /* Free-fall phase: magnitude below this threshold (in g) */
+  /* Screen-down phase: X rises this far above its resting baseline (in g) */
 
-  float free_fall_threshold;
-  int free_fall_min_ms;
+  float downward_delta_threshold;
+  int downward_min_ms;
 
-  /* Impact phase: magnitude above this threshold (in g) */
+  /* Reserved for a future impact-confirmation stage. */
 
   float impact_threshold;
   int impact_window_ms;
@@ -49,7 +49,7 @@ struct fall_detect_state
   enum
   {
     FALL_PHASE_IDLE = 0,
-    FALL_PHASE_FREE_FALL,
+    FALL_PHASE_DOWNWARD,
     FALL_PHASE_IMPACT,
     FALL_PHASE_STILLNESS,
   } phase;
@@ -59,6 +59,10 @@ struct fall_detect_state
   int fall_count;       /* total falls detected since start */
   int running;          /* 1 = task active */
   float last_magnitude;
+  float last_x;
+  float last_downward_delta;
+  float baseline_x;
+  float trigger_delta;
 };
 
 /****************************************************************************

@@ -126,6 +126,7 @@ static void print_help(void)
   printf("  blind_badge_app fall_stop\n");
   printf("  blind_badge_app fall_status\n");
   printf("  blind_badge_app fall_read\n");
+  printf("  blind_badge_app accel_read [samples]\n");
   printf("  blind_badge_app vision_start <server_ipv4> [port]\n");
   printf("  blind_badge_app vision_once <server_ipv4> [port]\n");
   printf("  blind_badge_app vision_stop|vision_status\n");
@@ -1411,6 +1412,8 @@ static pthread_mutex_t g_sd_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_button_wifi_running;
 static bool g_wifi_sd_mounted;
 
+static void fall_detect_callback(void *arg);
+
 static void blind_badge_wifi_strip_line_end(char *line)
 {
   size_t length = strlen(line);
@@ -1824,6 +1827,11 @@ static int handle_button_service(int argc)
   g_button_service_running = 1;
   blind_badge_menu_show();
   blind_badge_start_ai_sd_worker();
+  if (fall_detect_start("/dev/i2c0", NULL,
+                        fall_detect_callback, NULL) < 0)
+    {
+      printf("[BlindBadge] passive alert: accelerometer unavailable\n");
+    }
 
   while (g_button_service_running)
     {
@@ -1997,6 +2005,7 @@ static int handle_button_service(int argc)
       close(adc_fd);
     }
 #endif
+  (void)fall_detect_stop();
   close(fd);
   g_button_service_running = 0;
   printf("[BlindBadge] button_service: stopped\n");
@@ -2032,30 +2041,11 @@ static int handle_state_command(int argc, char *argv[])
  * Fall detection
  ****************************************************************************/
 
-static struct blind_badge_cli_options g_fall_ai_options =
-  {
-    .ai_mode = BLIND_BADGE_AI_OFF,
-#ifdef CONFIG_VIDEO_FB
-    .use_lcd = 1,
-#else
-    .use_lcd = 0,
-#endif
-    .option_count = 0
-  };
-
 static void fall_detect_callback(void *arg)
 {
-  struct blind_badge_event event =
-    {
-      .type = BLIND_BADGE_EVENT_EMERGENCY,
-      .direction = BLIND_BADGE_DIR_UNKNOWN,
-      .severity = BLIND_BADGE_SEVERITY_EMERGENCY,
-      .distance_cm = 0
-    };
-
   (void)arg;
-  printf("[BlindBadge] fall_detect: fall confirmed, triggering emergency\n");
-  run_event(&event, &g_fall_ai_options);
+  printf("[BlindBadge] fall_detect: requesting service preemption\n");
+  blind_badge_menu_request_alert();
 }
 
 static int handle_fall_start(int argc, char *argv[],
@@ -2068,8 +2058,6 @@ static int handle_fall_start(int argc, char *argv[],
     {
       return ret;
     }
-
-  g_fall_ai_options = *options;
 
   ret = fall_detect_start("/dev/i2c0", NULL, fall_detect_callback, NULL);
   if (ret < 0)
@@ -2097,7 +2085,7 @@ static int handle_fall_status(int argc)
   struct fall_detect_state st;
   static const char *phase_names[] =
   {
-    "IDLE", "FREE_FALL", "IMPACT", "STILLNESS"
+    "IDLE", "DOWNWARD", "IMPACT", "STILLNESS"
   };
 
   if (argc != 2)
@@ -2108,24 +2096,51 @@ static int handle_fall_status(int argc)
 
   fall_detect_get_state(&st);
   printf("[BlindBadge] fall_status: running=%d phase=%s "
-         "last_magnitude=%.2fg fall_count=%d cooldown=%dms\n",
+         "magnitude=%.3fg x=%.3fg down_delta=%.3fg "
+         "baseline_x=%.3fg trigger_delta=%.3fg "
+         "fall_count=%d cooldown=%dms\n",
          st.running,
          st.phase < 4 ? phase_names[st.phase] : "UNKNOWN",
-         (double)st.last_magnitude, st.fall_count,
+         (double)st.last_magnitude,
+         (double)st.last_x,
+         (double)st.last_downward_delta,
+         (double)st.baseline_x,
+         (double)st.trigger_delta, st.fall_count,
          st.cooldown_remaining_ms);
   return 0;
 }
 
-static int handle_fall_read(int argc)
+static int handle_accel_read(int argc, char *argv[], bool legacy)
 {
   struct qma7981_dev dev;
   struct qma7981_sample sample;
+  char *end;
+  long samples = 1;
+  long i;
   int ret;
 
-  if (argc != 2)
+  if (legacy)
     {
-      printf("[BlindBadge] error: fall_read takes no arguments.\n");
+      if (argc != 2)
+        {
+          printf("[BlindBadge] error: fall_read takes no arguments.\n");
+          return 1;
+        }
+    }
+  else if (argc < 2 || argc > 3)
+    {
+      printf("[BlindBadge] error: accel_read [samples].\n");
       return 1;
+    }
+  else if (argc == 3)
+    {
+      errno = 0;
+      samples = strtol(argv[2], &end, 10);
+      if (errno != 0 || *end != '\0' || samples < 1 || samples > 100)
+        {
+          printf("[BlindBadge] error: samples must be 1..100.\n");
+          return 1;
+        }
     }
 
   ret = qma7981_init(&dev, "/dev/i2c0");
@@ -2135,17 +2150,31 @@ static int handle_fall_read(int argc)
       return 1;
     }
 
-  ret = qma7981_read_sample(&dev, &sample);
-  if (ret < 0)
+  for (i = 0; i < samples; i++)
     {
-      printf("[BlindBadge] error: read failed (%d)\n", ret);
-      qma7981_close(&dev);
-      return 1;
+      ret = qma7981_read_sample(&dev, &sample);
+      if (ret < 0)
+        {
+          printf("[BlindBadge] error: sample %ld read failed (%d)\n",
+                 i + 1, ret);
+          (void)qma7981_set_standby(&dev);
+          qma7981_close(&dev);
+          return 1;
+        }
+
+      printf("[BlindBadge] accel[%ld/%ld]: "
+             "x=%+.3fg y=%+.3fg z=%+.3fg |a|=%.3fg\n",
+             i + 1, samples,
+             (double)sample.x, (double)sample.y,
+             (double)sample.z, (double)sample.magnitude);
+
+      if (i + 1 < samples)
+        {
+          usleep(50000);
+        }
     }
 
-  printf("[BlindBadge] accel: x=%.3fg y=%.3fg z=%.3fg |a|=%.3fg\n",
-         (double)sample.x, (double)sample.y,
-         (double)sample.z, (double)sample.magnitude);
+  (void)qma7981_set_standby(&dev);
   qma7981_close(&dev);
   return 0;
 }
@@ -2480,7 +2509,12 @@ int main(int argc, char *argv[])
 
   if (strcmp(argv[1], "fall_read") == 0)
     {
-      return handle_fall_read(argc);
+      return handle_accel_read(argc, argv, true);
+    }
+
+  if (strcmp(argv[1], "accel_read") == 0)
+    {
+      return handle_accel_read(argc, argv, false);
     }
 
   if (strcmp(argv[1], "vision_start") == 0 ||

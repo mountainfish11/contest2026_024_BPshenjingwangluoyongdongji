@@ -2,7 +2,8 @@
  * Contest 2026 team 024 - QMA7981 3-axis accelerometer driver
  *
  * QMA7981 is the on-board accelerometer of ESP32-S3-EYE.
- * I2C address: 0x12 (7-bit).  Chip ID at reg 0x00 reads 0x90.
+ * I2C address: 0x12 (7-bit).  ESP32-S3-EYE production boards have
+ * been observed with chip ID 0x90; newer revisions use the 0xEx family.
  *
  * Uses the NuttX I2C character device (/dev/i2c0) via ioctl.
  ****************************************************************************/
@@ -17,7 +18,9 @@
  ****************************************************************************/
 
 #define QMA7981_I2C_ADDR      0x12
-#define QMA7981_CHIP_ID       0x90
+#define QMA7981_CHIP_ID_LEGACY 0x90
+#define QMA7981_CHIP_ID_MASK  0xf0
+#define QMA7981_CHIP_ID_VALUE 0xe0
 
 /* Register map */
 
@@ -31,32 +34,31 @@
 #define QMA7981_REG_RANGE     0x0f
 #define QMA7981_REG_BW        0x10
 #define QMA7981_REG_MODE      0x11
+#define QMA7981_REG_NVM_CTRL  0x33
 
 /* Range settings for REG_RANGE */
 
-#define QMA7981_RANGE_2G      0x00
-#define QMA7981_RANGE_4G      0x01
-#define QMA7981_RANGE_8G      0x02
-#define QMA7981_RANGE_16G     0x03
+#define QMA7981_RANGE_2G      0x01
+#define QMA7981_RANGE_4G      0x02
+#define QMA7981_RANGE_8G      0x04
+#define QMA7981_RANGE_16G     0x08
 
 /* Bandwidth settings for REG_BW */
 
-#define QMA7981_BW_100HZ      0x00
-#define QMA7981_BW_200HZ      0x01
-#define QMA7981_BW_400HZ      0x02
-#define QMA7981_BW_800HZ      0x03
+#define QMA7981_BW_MCLK_7695  0xe0
 
 /* Mode settings for REG_MODE */
 
 #define QMA7981_MODE_STANDBY  0x00
 #define QMA7981_MODE_ACTIVE   0x80
+#define QMA7981_NVM_LOAD      0x08
 
 /* Full-scale sensitivity (LSB per g) */
 
-#define QMA7981_SENS_2G       16384
-#define QMA7981_SENS_4G       8192
-#define QMA7981_SENS_8G       4096
-#define QMA7981_SENS_16G      2048
+#define QMA7981_SENS_2G       4096
+#define QMA7981_SENS_4G       2048
+#define QMA7981_SENS_8G       1024
+#define QMA7981_SENS_16G      512
 
 /****************************************************************************
  * Public Types
@@ -74,6 +76,7 @@ struct qma7981_dev
 {
   int fd;             /* /dev/i2cN file descriptor */
   uint8_t addr;
+  uint8_t chip_id;
   uint8_t range;      /* QMA7981_RANGE_xx */
   float sensitivity;  /* LSB per g for current range */
 };
@@ -83,8 +86,8 @@ struct qma7981_dev
  ****************************************************************************/
 
 /**
- * Open I2C device node, verify QMA7981 chip ID, set ±2g range,
- * 100 Hz bandwidth, and enter active mode.
+ * Open I2C device node, verify QMA7981 chip ID, set ±8g range,
+ * configure the default output bandwidth, and enter active mode.
  *
  * @param dev       Device handle (filled on success).
  * @param i2c_path  e.g. "/dev/i2c0".

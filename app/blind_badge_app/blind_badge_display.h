@@ -38,6 +38,8 @@ int blind_badge_display_show_service(const char *title,
                                      const char *state,
                                      const char *detail,
                                      const char *hint);
+int blind_badge_display_show_passive_alert(const char *state,
+                                           const char *detail);
 int blind_badge_display_show_event(const struct blind_badge_event *event,
                                    const char *message);
 int blind_badge_display_show_ai_event(const struct blind_badge_event *event,

@@ -33,6 +33,10 @@ int blind_badge_menu_leave(void);
 
 void blind_badge_menu_request_leave(void);
 
+/* Post a non-blocking emergency preemption request from a detector. */
+
+void blind_badge_menu_request_alert(void);
+
 /* Redraw the service page only when its state or detail line changed.
  * No-op while the menu list is visible.
  */

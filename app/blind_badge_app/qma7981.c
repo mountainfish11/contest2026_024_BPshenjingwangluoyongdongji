@@ -2,7 +2,8 @@
  * Contest 2026 team 024 - QMA7981 3-axis accelerometer driver
  *
  * ESP32-S3-EYE board: QMA7981 on I2C bus 0, address 0x12.
- * Data registers are 12-bit left-justified in 16-bit (LSB first).
+ * Data registers are 14-bit two's-complement values.  Each LSB register
+ * stores data bits 5:0 in bits 7:2 and status bits in bits 1:0.
  *
  * Uses the NuttX I2C character device (/dev/i2c0) via I2CIOC_TRANSFER.
  ****************************************************************************/
@@ -136,13 +137,37 @@ int qma7981_init(struct qma7981_dev *dev, const char *i2c_path)
       goto err_close;
     }
 
-  if (chip_id != QMA7981_CHIP_ID)
+  if (chip_id != QMA7981_CHIP_ID_LEGACY &&
+      (chip_id & QMA7981_CHIP_ID_MASK) != QMA7981_CHIP_ID_VALUE)
     {
       printf("[QMA7981] error: unexpected chip ID 0x%02x "
-             "(expected 0x%02x)\n", chip_id, QMA7981_CHIP_ID);
+             "(expected 0x90 or 0xEx)\n", chip_id);
       ret = -ENODEV;
       goto err_close;
     }
+
+  dev->chip_id = chip_id;
+
+  /* Load the factory trim image.  QMA6100P-compatible 0x90 parts require
+   * active mode while NVM_LOAD is asserted.  This also recovers cleanly if
+   * the sensor was reset independently of the MCU.
+   */
+
+  ret = qma7981_writereg8(dev, QMA7981_REG_MODE, QMA7981_MODE_ACTIVE);
+  if (ret < 0)
+    {
+      goto err_close;
+    }
+
+  usleep(5000);
+
+  ret = qma7981_writereg8(dev, QMA7981_REG_NVM_CTRL, QMA7981_NVM_LOAD);
+  if (ret < 0)
+    {
+      goto err_close;
+    }
+
+  usleep(5000);
 
   /* Standby before configuring */
 
@@ -152,20 +177,21 @@ int qma7981_init(struct qma7981_dev *dev, const char *i2c_path)
       goto err_close;
     }
 
-  /* ±2g range — best resolution for fall detection */
+  /* ±8g preserves impact peaks while retaining 0.977 mg/LSB resolution. */
 
-  ret = qma7981_writereg8(dev, QMA7981_REG_RANGE, QMA7981_RANGE_2G);
+  ret = qma7981_writereg8(dev, QMA7981_REG_RANGE, QMA7981_RANGE_8G);
   if (ret < 0)
     {
       goto err_close;
     }
 
-  dev->range       = QMA7981_RANGE_2G;
-  dev->sensitivity = (float)QMA7981_SENS_2G;
+  dev->range       = QMA7981_RANGE_8G;
+  dev->sensitivity = (float)QMA7981_SENS_8G;
 
-  /* 100 Hz bandwidth — sufficient for fall detection */
+  /* Keep the reserved high bits at their documented values. */
 
-  ret = qma7981_writereg8(dev, QMA7981_REG_BW, QMA7981_BW_100HZ);
+  ret = qma7981_writereg8(dev, QMA7981_REG_BW,
+                          QMA7981_BW_MCLK_7695);
   if (ret < 0)
     {
       goto err_close;
@@ -179,7 +205,9 @@ int qma7981_init(struct qma7981_dev *dev, const char *i2c_path)
       goto err_close;
     }
 
-  printf("[QMA7981] initialized: chip_id=0x%02x range=±2g bw=100Hz "
+  usleep(5000);
+
+  printf("[QMA7981] initialized: chip_id=0x%02x range=±8g "
          "dev=%s\n", chip_id, i2c_path);
   return 0;
 
@@ -219,11 +247,16 @@ int qma7981_read_sample(struct qma7981_dev *dev, struct qma7981_sample *out)
       return ret;
     }
 
-  /* 12-bit left-justified: take full 16-bit signed value */
+  /* Reconstruct the signed 14-bit value.  The two status bits in each LSB
+   * byte must not be interpreted as acceleration data.
+   */
 
-  raw_x = (int16_t)((buf[1] << 8) | buf[0]);
-  raw_y = (int16_t)((buf[3] << 8) | buf[2]);
-  raw_z = (int16_t)((buf[5] << 8) | buf[4]);
+  raw_x = (int16_t)((buf[1] << 8) | (buf[0] & 0xfc));
+  raw_y = (int16_t)((buf[3] << 8) | (buf[2] & 0xfc));
+  raw_z = (int16_t)((buf[5] << 8) | (buf[4] & 0xfc));
+  raw_x >>= 2;
+  raw_y >>= 2;
+  raw_z >>= 2;
 
   out->x = (float)raw_x / dev->sensitivity;
   out->y = (float)raw_y / dev->sensitivity;

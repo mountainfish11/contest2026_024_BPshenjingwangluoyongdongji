@@ -77,6 +77,8 @@ static size_t g_menu_selected;
 static enum blind_badge_menu_page g_menu_page;
 static bool g_menu_redraw_pending;
 static volatile bool g_menu_leave_requested;
+static volatile bool g_menu_alert_requested;
+static bool g_menu_passive_alert;
 static bool g_speech_link_was_connected;
 static int g_speech_mode_sent = -1;
 static char g_menu_cached_state[BLIND_BADGE_MENU_STATE_SIZE];
@@ -197,6 +199,11 @@ static int render_service_page(void)
   strlcpy(g_menu_cached_state, name, sizeof(g_menu_cached_state));
   strlcpy(g_menu_cached_detail, detail, sizeof(g_menu_cached_detail));
 
+  if (id == BLIND_BADGE_MENU_ALERT && g_menu_passive_alert)
+    {
+      return blind_badge_display_show_passive_alert(name, detail);
+    }
+
   return blind_badge_display_show_service(blind_badge_service_label(id),
                                           name, detail, "2x PLAY  BACK");
 }
@@ -215,6 +222,7 @@ int blind_badge_menu_show(void)
 
   menu_build_arrays(labels, icons);
   g_menu_page = BLIND_BADGE_MENU_PAGE_LIST;
+  g_menu_passive_alert = false;
   g_menu_leave_requested = false;
   g_menu_redraw_pending = false;
 
@@ -285,6 +293,7 @@ int blind_badge_menu_enter(void)
     }
 
   selected = blind_badge_menu_selected();
+  g_menu_passive_alert = false;
   (void)menu_sync_speech_mode(
     selected == BLIND_BADGE_MENU_VISION ? BLIND_BADGE_SPEECH_MODE_VISION :
     selected == BLIND_BADGE_MENU_VOICE ? BLIND_BADGE_SPEECH_MODE_VOICE :
@@ -328,8 +337,61 @@ void blind_badge_menu_request_leave(void)
   g_menu_leave_requested = true;
 }
 
+void blind_badge_menu_request_alert(void)
+{
+  g_menu_alert_requested = true;
+}
+
+static int menu_start_emergency_alert(void)
+{
+  enum blind_badge_service_state state;
+  size_t i;
+  int ret;
+
+  g_menu_alert_requested = false;
+  g_menu_leave_requested = false;
+
+  /* Reuse normal service teardown so camera, ASR, health sensing and AI
+   * work release their resources before ALERT takes ownership.
+   */
+
+  state = blind_badge_service_state();
+  if (state != BLIND_BADGE_SERVICE_IDLE)
+    {
+      (void)blind_badge_service_stop();
+    }
+
+  for (i = 0; i < sizeof(g_menu_items) / sizeof(g_menu_items[0]); i++)
+    {
+      if (g_menu_items[i].id == BLIND_BADGE_MENU_ALERT)
+        {
+          g_menu_selected = i;
+          break;
+        }
+    }
+
+  g_speech_mode_sent = -1;
+  g_menu_passive_alert = true;
+  (void)menu_sync_speech_mode(BLIND_BADGE_SPEECH_MODE_ALERT);
+  ret = blind_badge_service_start(BLIND_BADGE_MENU_ALERT);
+
+  g_menu_page = BLIND_BADGE_MENU_PAGE_SERVICE;
+  g_menu_cached_state[0] = '\0';
+  g_menu_cached_detail[0] = '\0';
+  (void)render_service_page();
+
+  printf("[BlindBadge] passive alert: active service preempted, "
+         "ALERT result=%d\n", ret);
+  return ret;
+}
+
 int blind_badge_menu_refresh(void)
 {
+  if (g_menu_alert_requested)
+    {
+      return menu_start_emergency_alert();
+    }
+
   if (g_menu_page == BLIND_BADGE_MENU_PAGE_SERVICE &&
       g_menu_leave_requested)
     {

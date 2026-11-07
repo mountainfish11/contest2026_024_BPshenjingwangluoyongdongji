@@ -1189,6 +1189,50 @@ int blind_badge_display_show_service(const char *title, const char *state,
 #endif
 }
 
+int blind_badge_display_show_passive_alert(const char *state,
+                                           const char *detail)
+{
+#ifdef CONFIG_VIDEO_FB
+  struct blind_badge_fb fb;
+  int ret;
+
+  ret = fb_open(&fb);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  fill_rect(&fb, 0, 0, fb.vinfo.xres, fb.vinfo.yres, 0, 0, 0);
+  fill_rect(&fb, 0, 0, fb.vinfo.xres, 8, 230, 45, 35);
+  fill_rect(&fb, 0, fb.vinfo.yres - 8, fb.vinfo.xres, 8,
+            230, 45, 35);
+
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 25, "!", 8,
+                           255, 70, 45);
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 105,
+                           "PASSIVE ALERT", 2, 255, 255, 255);
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 142,
+                           state != NULL ? state : "RUNNING", 2,
+                           255, 90, 55);
+
+  if (detail != NULL && detail[0] != '\0')
+    {
+      draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 174,
+                               detail, 1, 220, 220, 220);
+    }
+
+  draw_ascii_text_centered(&fb, fb.vinfo.xres / 2, 211,
+                           "2x PLAY  BACK", 1, 110, 110, 110);
+  update_screen(&fb);
+  fb_close(&fb);
+  return 0;
+#else
+  (void)state;
+  (void)detail;
+  return -ENODEV;
+#endif
+}
+
 int blind_badge_display_show_boot_status(int connected)
 {
   if (connected > 0)
